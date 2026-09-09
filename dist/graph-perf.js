@@ -269,17 +269,15 @@ function instrumentSource() {
 * and are announced to the Nx processes through a marker file, so nothing has to
 * survive the daemon's environment filtering.
 *
-* Nx starts its daemon with NX_PERF_LOGGING=true on its own; the variable is set
-* here as well so the client side of the cold run also reports its phases.
 * NX_DAEMON=true is forced because Nx turns the daemon off under CI and inside
 * Docker, and a daemonless run measures something else.
 */
 const ENV_OVERRIDES = {
-	NX_PERF_LOGGING: "true",
 	DOTNET_ROLL_FORWARD_TO_PRERELEASE: "1",
 	NX_TUI: "false",
 	NX_DAEMON: "true"
 };
+const INJECTED_BY_NX = /* @__PURE__ */ new Set(["NX_ANALYTICS_SESSION_ID", "NX_USE_V8_SERIALIZER"]);
 function parseArgs(argv) {
 	const opts = {
 		runs: 3,
@@ -306,12 +304,9 @@ function parseArgs(argv) {
 	return opts;
 }
 function openWorkspace(root) {
-	const { CI: _ci, ...inheritedEnv } = process.env;
-	delete process.env.CI;
-	Object.assign(process.env, {
-		NX_DAEMON: ENV_OVERRIDES.NX_DAEMON,
-		NX_TUI: ENV_OVERRIDES.NX_TUI
-	});
+	for (const key of Object.keys(process.env)) if (key === "CI" || /^NX_TASK_/.test(key) || INJECTED_BY_NX.has(key)) delete process.env[key];
+	const inheritedEnv = { ...process.env };
+	Object.assign(process.env, ENV_OVERRIDES, { NX_DAEMON: "false" });
 	const perfLogsRoot = node_path.default.join(root, ".nx", "workspace-data", "perf-logs");
 	const session = String(process.pid);
 	const require$1 = (0, node_module.createRequire)(node_path.default.join(root, "package.json"));
@@ -610,7 +605,7 @@ function renderMarkdown(r) {
 		sections.push(h2("Key phases", "A phase that stays slow warm costs every command, not just the first.", renderKeyPhases(r.workspaceRoot, r.traces)));
 	}
 	sections.push(h2("Plugin config files", ...renderPluginConfigFiles(r.pluginConfigFiles)));
-	sections.push(h2("nx report", ...renderReport(r.report)));
+	sections.push(h2("nx report", ...renderReport(r.report, r.traces, r.records !== null)));
 	sections.push(h2("nx.json", ...["plugins", "targetDefaults"].map((key) => h3(key, codeBlock(JSON.stringify("error" in r.nxJson ? r.nxJson.error : r.nxJson[key] ?? null, null, 2), "json")))));
 	return h1("Nx graph construction", summary, ...sections) + "\n";
 }
@@ -701,10 +696,11 @@ function renderPluginConfigFiles(plugins) {
 		}]) : "No matching files.");
 	})];
 }
-function renderReport(report) {
+function renderReport(report, traces, instrumented) {
 	if ("error" in report) return [String(report.error)];
 	const parts = [];
-	const daemon = "error" in report.daemon ? `error: ${report.daemon.error}` : report.daemon.disabled ? "disabled" : report.daemon.available ? "running" : "not running";
+	const daemonTrace = traces.find((t) => t.role === "daemon");
+	const daemon = daemonTrace ? `recorded (pid ${daemonTrace.pid})` : instrumented ? "not recorded: either none ran, or one started before this run and still has the original module" : "unknown, instrumentation was off";
 	parts.push(ul(`Package manager: ${report.pm} ${report.pmVersion}`, `Daemon: ${daemon}`, `Native binding: ${report.nativeTarget ?? "not available"}`, `Cache: ${report.cache ? `${(report.cache.used / 1024 ** 2).toFixed(0)} MB used of ${(report.cache.max / 1024 ** 2).toFixed(0)} MB` : "db cache off"}`, `Nx key: ${report.nxKey ? report.nxKey.licenseType ?? "present" : report.nxKeyError ? `error: ${report.nxKeyError}` : "none"}`));
 	if (report.projectGraphError) parts.push(blockQuote(`Project graph error: ${report.projectGraphError}`));
 	const versions = report.packageVersionsWeCareAbout;

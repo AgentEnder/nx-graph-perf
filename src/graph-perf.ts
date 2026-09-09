@@ -21,8 +21,6 @@
  * and are announced to the Nx processes through a marker file, so nothing has to
  * survive the daemon's environment filtering.
  *
- * Nx starts its daemon with NX_PERF_LOGGING=true on its own; the variable is set
- * here as well so the client side of the cold run also reports its phases.
  * NX_DAEMON=true is forced because Nx turns the daemon off under CI and inside
  * Docker, and a daemonless run measures something else.
  */
@@ -132,12 +130,15 @@ interface Workspace {
   sessionDir: string;
 }
 
+// Applied to the measured commands. NX_PERF_LOGGING is left alone; the daemon
+// sets it for itself and the instrumented module records without it.
 const ENV_OVERRIDES = {
-  NX_PERF_LOGGING: 'true',
   DOTNET_ROLL_FORWARD_TO_PRERELEASE: '1',
   NX_TUI: 'false',
   NX_DAEMON: 'true',
 };
+
+const INJECTED_BY_NX = new Set(['NX_ANALYTICS_SESSION_ID', 'NX_USE_V8_SERIALIZER']);
 
 function parseArgs(argv: string[]): Options {
   const opts: Options = { runs: 3, out: '.', reset: true, instrument: true, instrumentFile: null };
@@ -162,12 +163,18 @@ function parseArgs(argv: string[]): Options {
 }
 
 function openWorkspace(root: string): Workspace {
-  const { CI: _ci, ...inheritedEnv } = process.env;
-  // nx is also loaded into this process for the report and plugin data; its
-  // daemon status must describe the same environment the measured runs had.
-  // Perf logging stays off here so that load does not echo timing lines.
-  delete process.env.CI;
-  Object.assign(process.env, { NX_DAEMON: ENV_OVERRIDES.NX_DAEMON, NX_TUI: ENV_OVERRIDES.NX_TUI });
+  // Drop what a wrapping nx or CI invocation stamped on this process. The
+  // daemon rebuilds the graph when a client's env differs from the last one,
+  // and these change on every `nx run` of the collector itself.
+  for (const key of Object.keys(process.env)) {
+    if (key === 'CI' || /^NX_TASK_/.test(key) || INJECTED_BY_NX.has(key)) delete process.env[key];
+  }
+  const inheritedEnv = { ...process.env };
+  // nx is also loaded into this process, after the timed runs, for the report
+  // and plugin data. It must not talk to the daemon: a request from here
+  // carries an environment no CLI client has, and the daemon answers such a
+  // change by rebuilding the graph, once now and once for the next client.
+  Object.assign(process.env, ENV_OVERRIDES, { NX_DAEMON: 'false' });
   const perfLogsRoot = path.join(root, '.nx', 'workspace-data', 'perf-logs');
   const session = String(process.pid);
   // Node's own resolver anchored at the workspace. The ambient `require` is
@@ -561,7 +568,7 @@ function renderMarkdown(r: Collected): string {
   }
 
   sections.push(md.h2('Plugin config files', ...renderPluginConfigFiles(r.pluginConfigFiles)));
-  sections.push(md.h2('nx report', ...renderReport(r.report)));
+  sections.push(md.h2('nx report', ...renderReport(r.report, r.traces, r.records !== null)));
 
   const nxJsonKeys = ['plugins', 'targetDefaults'] as const;
   sections.push(
@@ -645,17 +652,15 @@ function renderPluginConfigFiles(plugins: PluginConfigFiles[] | Failure): string
   ];
 }
 
-function renderReport(report: ReportData): string[] {
+function renderReport(report: ReportData, traces: ProcessTrace[], instrumented: boolean): string[] {
   if ('error' in report) return [String(report.error)];
   const parts: string[] = [];
-  const daemon =
-    'error' in report.daemon
-      ? `error: ${report.daemon.error}`
-      : report.daemon.disabled
-        ? 'disabled'
-        : report.daemon.available
-          ? 'running'
-          : 'not running';
+  const daemonTrace = traces.find((t) => t.role === 'daemon');
+  const daemon = daemonTrace
+    ? `recorded (pid ${daemonTrace.pid})`
+    : instrumented
+      ? 'not recorded: either none ran, or one started before this run and still has the original module'
+      : 'unknown, instrumentation was off';
   parts.push(
     md.ul(
       `Package manager: ${report.pm} ${report.pmVersion}`,

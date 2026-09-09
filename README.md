@@ -64,13 +64,13 @@ The daemon is forced on (`NX_DAEMON=true`) because Nx disables it under CI and i
 
 ## Options
 
-| Flag                | Default | Meaning                                                               |
-| ------------------- | ------- | --------------------------------------------------------------------- |
-| `--runs N`          | `3`     | Total runs. The first is cold, the rest are warm.                     |
-| `--out DIR`         | `.`     | Where to write the report.                                            |
-| `--no-reset`        |         | Skip `nx reset`. The cold run is then whatever the daemon has cached. |
-| `--no-instrument`   |         | Only time the commands. No module swap, no per-process measures.      |
-| `--instrument FILE` |         | Use a local instrumented module instead of the bundled one.           |
+| Flag                | Default | Meaning                                                                                                                                                               |
+| ------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--runs N`          | `3`     | Total runs. The first is cold, the rest are warm.                                                                                                                     |
+| `--out DIR`         | `.`     | Where to write the report.                                                                                                                                            |
+| `--no-reset`        |         | Skip `nx reset`. The cold run is then whatever the daemon has cached, and a daemon that predates the run cannot be instrumented, so it will not appear in the report. |
+| `--no-instrument`   |         | Only time the commands. No module swap, no per-process measures.                                                                                                      |
+| `--instrument FILE` |         | Use a local instrumented module instead of the bundled one.                                                                                                           |
 
 ## What the report contains
 
