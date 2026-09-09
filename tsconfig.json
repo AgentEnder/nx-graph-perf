@@ -1,14 +1,14 @@
 {
   "compilerOptions": {
-    "allowJs": true,
-    "checkJs": true,
     "noEmit": true,
     "strict": true,
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "target": "ES2022",
     "types": ["node"],
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": true
   },
-  "include": ["src/graph-perf.js", "src/types.d.ts", "build.mjs", "scripts/make-fixture.js", "scripts/run.js"]
+  "include": ["src/**/*.ts", "scripts/**/*.ts", "scripts/make-fixture.js", "rolldown.config.ts"]
 }

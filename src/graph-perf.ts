@@ -1,13 +1,12 @@
-// @ts-check
-
 /**
  * Nx graph construction perf extraction.
  *
  * Resets the daemon, swaps nx's perf-logging module for an instrumented copy
  * that records every performance measure of every Nx process (client, daemon,
  * plugin workers) as JSON lines, times a cold and several warm project-graph
- * constructions, collects the `nx report` data and the graph-relevant parts of
- * nx.json, restores the original module, and writes:
+ * constructions, collects the `nx report` data, the files each plugin's
+ * createNodes glob matches, and the graph-relevant parts of nx.json, restores
+ * the original module, and writes:
  *
  *   graph-perf.md   the report, built from the recorded measures
  *   graph-perf.json everything above, machine readable
@@ -30,24 +29,103 @@
 
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import * as md from 'markdown-factory';
-import INSTRUMENT_SOURCE from './perf-logging.js?text';
+import { instrumentSource } from './instrument';
 
-/** @typedef {{ kind: 'process', pid: number, ppid: number, argv: string[], execArgv: string[], cwd: string, node: string, timeOrigin: number }} ProcessRecord */
-/** @typedef {{ kind: 'measure', pid: number, name: string, startTime: number, duration: number, detail: unknown }} MeasureRecord */
-/** @typedef {{ pid: number, ppid: number, role: string, argv: string[], timeOrigin: number, measures: MeasureRecord[] }} ProcessTrace */
+interface Options {
+  runs: number;
+  out: string;
+  reset: boolean;
+  instrument: boolean;
+  instrumentFile: string | null;
+}
 
-/** @param {string[]} argv */
-function parseArgs(argv) {
-  const opts = {
-    runs: 3,
-    out: '.',
-    reset: true,
-    instrument: true,
-    instrumentFile: /** @type {string | null} */ (null),
-  };
+interface ProcessRecord {
+  kind: 'process';
+  pid: number;
+  ppid: number;
+  argv: string[];
+  execArgv: string[];
+  cwd: string;
+  node: string;
+  timeOrigin: number;
+}
+
+type MeasureRecord = {
+  kind: 'measure';
+  pid: number;
+  name: string;
+  startTime: number;
+  duration: number;
+  detail: unknown;
+};
+
+type ProcessTrace = {
+  pid: number;
+  ppid: number;
+  role: string;
+  argv: string[];
+  timeOrigin: number;
+  measures: MeasureRecord[];
+};
+
+type PluginConfigFiles = {
+  name: string;
+  pattern: string;
+  include: string[] | null;
+  exclude: string[] | null;
+  total: number;
+  files: { file: string; count: number }[];
+};
+
+interface Failure {
+  error: string;
+}
+
+type NxJsonSummary = { plugins: unknown; targetDefaults: unknown; namedInputs: unknown } | Failure;
+
+type ReportData = Record<string, any>;
+
+interface SystemInfo {
+  platform: string;
+  release: string;
+  arch: string;
+  cpus: number;
+  cpuModel: string | null;
+  memoryGb: number;
+  node: string;
+}
+
+interface CommandResult {
+  status: number;
+  stdout: string;
+  stderr: string;
+  wallMs: number;
+}
+
+/** Everything that depends on which workspace is being measured. */
+interface Workspace {
+  root: string;
+  require: NodeJS.Require;
+  env: NodeJS.ProcessEnv;
+  nxBin: string | null;
+  perfLogsRoot: string;
+  session: string;
+  sessionDir: string;
+}
+
+const ENV_OVERRIDES = {
+  NX_PERF_LOGGING: 'true',
+  DOTNET_ROLL_FORWARD_TO_PRERELEASE: '1',
+  NX_TUI: 'false',
+  NX_DAEMON: 'true',
+};
+
+function parseArgs(argv: string[]): Options {
+  const opts: Options = { runs: 3, out: '.', reset: true, instrument: true, instrumentFile: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--runs') opts.runs = Math.max(1, Number(argv[++i]));
@@ -68,53 +146,53 @@ function parseArgs(argv) {
   return opts;
 }
 
-const workspaceRoot = process.cwd();
-const overrides = {
-  NX_PERF_LOGGING: 'true',
-  DOTNET_ROLL_FORWARD_TO_PRERELEASE: '1',
-  NX_TUI: 'false',
-  NX_DAEMON: 'true',
-};
-const { CI: _ci, ...inheritedEnv } = process.env;
-const env = { ...inheritedEnv, ...overrides };
-// nx is also loaded into this process for the report and plugin data; its
-// daemon status must describe the same environment the measured runs had.
-// Perf logging stays off here so that load does not echo timing lines.
-delete process.env.CI;
-Object.assign(process.env, { NX_DAEMON: overrides.NX_DAEMON, NX_TUI: overrides.NX_TUI });
+function openWorkspace(root: string): Workspace {
+  const { CI: _ci, ...inheritedEnv } = process.env;
+  // nx is also loaded into this process for the report and plugin data; its
+  // daemon status must describe the same environment the measured runs had.
+  // Perf logging stays off here so that load does not echo timing lines.
+  delete process.env.CI;
+  Object.assign(process.env, { NX_DAEMON: ENV_OVERRIDES.NX_DAEMON, NX_TUI: ENV_OVERRIDES.NX_TUI });
+  const perfLogsRoot = path.join(root, '.nx', 'workspace-data', 'perf-logs');
+  const session = String(process.pid);
+  // Node's own resolver anchored at the workspace. The ambient `require` is
+  // not enough: under jiti its resolve() ignores the `paths` option.
+  const require = createRequire(path.join(root, 'package.json'));
+  return {
+    root,
+    require,
+    env: { ...inheritedEnv, ...ENV_OVERRIDES },
+    // The workspace's own nx entry point, run with this node. `npx` would add
+    // its own startup to every timing, and on Windows that is a second or more.
+    nxBin: resolveFromWorkspace(require, 'nx/bin/nx.js'),
+    perfLogsRoot,
+    session,
+    sessionDir: path.join(perfLogsRoot, session),
+  };
+}
 
-/** @param {string} request */
-function resolveFromWorkspace(request) {
+function resolveFromWorkspace(require: NodeJS.Require, request: string): string | null {
   try {
-    return require.resolve(request, { paths: [workspaceRoot] });
+    return require.resolve(request);
   } catch {
     return null;
   }
 }
 
-// The workspace's own nx entry point, run with this node. `npx` would add its
-// own startup to every timing, and on Windows that is a second or more.
-const nxBin = resolveFromWorkspace('nx/bin/nx.js');
+/** Resolves a module inside the installed nx, under whichever layout it ships. */
+function resolveNxInternal(ws: Workspace, rel: string): string | null {
+  return resolveFromWorkspace(ws.require, `nx/dist/src/${rel}`) ?? resolveFromWorkspace(ws.require, `nx/src/${rel}`);
+}
 
-/**
- * Runs `nx <args>` and returns exit code, output and wall time.
- * @param {string[]} args
- */
-function nx(args) {
+/** Runs `nx <args>` and returns exit code, output and wall time. */
+function nx(ws: Workspace, args: string[]): CommandResult {
   const started = process.hrtime.bigint();
-  const result = nxBin
-    ? spawnSync(process.execPath, [nxBin, ...args], {
-        cwd: workspaceRoot,
-        env,
-        encoding: 'utf8',
-        maxBuffer: 64 * 1024 * 1024,
-      })
+  const common = { cwd: ws.root, env: ws.env, encoding: 'utf8' as const, maxBuffer: 64 * 1024 * 1024 };
+  const result = ws.nxBin
+    ? spawnSync(process.execPath, [ws.nxBin, ...args], common)
     : spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['nx', ...args], {
-        cwd: workspaceRoot,
-        env,
-        encoding: 'utf8',
+        ...common,
         shell: process.platform === 'win32',
-        maxBuffer: 64 * 1024 * 1024,
       });
   const wallMs = Number(process.hrtime.bigint() - started) / 1e6;
   if (result.error) throw result.error;
@@ -126,8 +204,7 @@ function nx(args) {
   };
 }
 
-/** @param {string} label @param {ReturnType<typeof nx>} result */
-function assertOk(label, result) {
+function assertOk(label: string, result: CommandResult): void {
   if (result.status !== 0) {
     console.error(`${label} failed (exit ${result.status})`);
     console.error(result.stderr || result.stdout);
@@ -135,15 +212,14 @@ function assertOk(label, result) {
   }
 }
 
-/** @param {number[]} values */
-function median(values) {
+function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-function readNxJson() {
-  const file = path.join(workspaceRoot, 'nx.json');
+function readNxJson(root: string): NxJsonSummary {
+  const file = path.join(root, 'nx.json');
   if (!fs.existsSync(file)) return { error: 'nx.json not found' };
   try {
     const json = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -153,28 +229,23 @@ function readNxJson() {
       namedInputs: json.namedInputs ?? null,
     };
   } catch (e) {
-    return { error: `nx.json unreadable: ${e instanceof Error ? e.message : String(e)}` };
+    return { error: `nx.json unreadable: ${errorMessage(e)}` };
   }
 }
 
-/**
- * Resolves a module inside the installed nx, under whichever layout it ships.
- * @param {string} rel path below nx's src directory
- */
-function resolveNxInternal(rel) {
-  return resolveFromWorkspace(`nx/dist/src/${rel}`) ?? resolveFromWorkspace(`nx/src/${rel}`);
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 /**
  * The data behind `nx report`, straight from the installed nx. Loading nx in
  * this process is fine here: recording is already withdrawn when it runs.
- * @returns {Promise<Record<string, any>>}
  */
-async function readReportData() {
-  const module = resolveNxInternal('command-line/report/report');
+async function readReportData(ws: Workspace): Promise<ReportData> {
+  const module = resolveNxInternal(ws, 'command-line/report/report');
   if (!module) return { error: 'nx report module not found' };
   try {
-    const { getReportData } = require(module);
+    const { getReportData } = ws.require(module);
     const data = await getReportData();
     for (const key of ['nxKeyError', 'projectGraphError']) {
       if (data[key] instanceof Error) data[key] = data[key].message;
@@ -182,45 +253,45 @@ async function readReportData() {
     if (data.daemon && 'error' in data.daemon) data.daemon = { error: String(data.daemon.error) };
     return data;
   } catch (e) {
-    return { error: `getReportData failed: ${e instanceof Error ? e.message : String(e)}` };
+    return { error: `getReportData failed: ${errorMessage(e)}` };
   }
 }
 
-/** @typedef {{ name: string, pattern: string, include: string[] | null, exclude: string[] | null, total: number, files: { file: string, count: number }[] }} PluginConfigFiles */
+interface LoadedPlugin {
+  name: string;
+  createNodes?: [pattern: string, fn: unknown];
+  include?: string[];
+  exclude?: string[];
+}
 
 /**
  * Loads the workspace's plugins the way nx does and counts the files each
  * plugin's createNodes glob matches, grouped by basename. A config file can
  * yield more than one project, so this bounds what a plugin contributes rather
  * than counting its projects.
- * @returns {Promise<PluginConfigFiles[] | { error: string }>}
  */
-async function readPluginConfigFiles() {
-  const getPlugins = resolveNxInternal('project-graph/plugins/get-plugins');
-  const workspaceContext = resolveNxInternal('utils/workspace-context');
-  const nxJsonModule = resolveNxInternal('config/nx-json');
-  const configUtils = resolveNxInternal('project-graph/utils/project-configuration-utils');
+async function readPluginConfigFiles(ws: Workspace): Promise<PluginConfigFiles[] | Failure> {
+  const root = ws.root;
+  const getPlugins = resolveNxInternal(ws, 'project-graph/plugins/get-plugins');
+  const workspaceContext = resolveNxInternal(ws, 'utils/workspace-context');
+  const nxJsonModule = resolveNxInternal(ws, 'config/nx-json');
+  const configUtils = resolveNxInternal(ws, 'project-graph/utils/project-configuration-utils');
   if (!getPlugins || !workspaceContext || !nxJsonModule || !configUtils) {
     return { error: 'nx plugin loading internals not found in this nx version' };
   }
   try {
-    const { getPlugins: loadPlugins, cleanupPlugins } = require(getPlugins);
-    const { globWithWorkspaceContextSync } = require(workspaceContext);
-    const { readNxJson } = require(nxJsonModule);
-    const { findMatchingConfigFiles } = require(configUtils);
-    /** @type {{ name: string, createNodes?: [string, unknown], include?: string[], exclude?: string[] }[]} */
-    const plugins = await loadPlugins(readNxJson(workspaceRoot), workspaceRoot);
-    /** @type {PluginConfigFiles[]} */
-    const result = [];
+    const { getPlugins: loadPlugins, cleanupPlugins } = ws.require(getPlugins);
+    const { globWithWorkspaceContextSync } = ws.require(workspaceContext);
+    const { readNxJson } = ws.require(nxJsonModule);
+    const { findMatchingConfigFiles } = ws.require(configUtils);
+    const plugins: LoadedPlugin[] = await loadPlugins(readNxJson(root), root);
+    const result: PluginConfigFiles[] = [];
     for (const plugin of plugins) {
       if (!plugin.createNodes) continue;
       const pattern = plugin.createNodes[0];
-      /** @type {string[]} */
-      const candidates = globWithWorkspaceContextSync(workspaceRoot, [pattern]);
-      /** @type {string[]} */
-      const matched = findMatchingConfigFiles(candidates, plugin.include, plugin.exclude);
-      /** @type {Map<string, number>} */
-      const counts = new Map();
+      const candidates: string[] = globWithWorkspaceContextSync(root, [pattern]);
+      const matched: string[] = findMatchingConfigFiles(candidates, plugin.include, plugin.exclude);
+      const counts = new Map<string, number>();
       for (const file of matched) {
         const base = path.basename(file);
         counts.set(base, (counts.get(base) ?? 0) + 1);
@@ -239,19 +310,20 @@ async function readPluginConfigFiles() {
     cleanupPlugins?.();
     return result;
   } catch (e) {
-    return { error: `plugin inspection failed: ${e instanceof Error ? e.message : String(e)}` };
+    return { error: `plugin inspection failed: ${errorMessage(e)}` };
   }
 }
 
 // ---------------------------------------------------------------------------
 // Instrumentation: swap nx's perf-logging module for the recording copy.
 
-/**
- * @param {string} source
- * @returns {{ restore: () => void, target: string } | null}
- */
-function installInstrument(source) {
-  const target = resolveNxInternal('utils/perf-logging.js');
+interface Instrument {
+  target: string;
+  restore(): void;
+}
+
+function installInstrument(ws: Workspace, source: string): Instrument | null {
+  const target = resolveNxInternal(ws, 'utils/perf-logging.js');
   if (!target) {
     console.warn('could not locate nx perf-logging module; running without instrumentation');
     return null;
@@ -271,31 +343,23 @@ function installInstrument(source) {
   return { restore, target };
 }
 
-const perfLogsRoot = path.join(workspaceRoot, '.nx', 'workspace-data', 'perf-logs');
-const session = String(process.pid);
-const sessionDir = path.join(perfLogsRoot, session);
-
-function announceSession() {
-  fs.mkdirSync(sessionDir, { recursive: true });
-  fs.writeFileSync(path.join(perfLogsRoot, 'ACTIVE'), session);
+function announceSession(ws: Workspace): void {
+  fs.mkdirSync(ws.sessionDir, { recursive: true });
+  fs.writeFileSync(path.join(ws.perfLogsRoot, 'ACTIVE'), ws.session);
 }
 
-function withdrawSession() {
-  fs.rmSync(path.join(perfLogsRoot, 'ACTIVE'), { force: true });
+function withdrawSession(ws: Workspace): void {
+  fs.rmSync(path.join(ws.perfLogsRoot, 'ACTIVE'), { force: true });
 }
 
-/** @returns {ProcessTrace[]} */
-function readTraces() {
-  if (!fs.existsSync(sessionDir)) return [];
-  /** @type {ProcessTrace[]} */
-  const traces = [];
-  for (const file of fs.readdirSync(sessionDir)) {
+function readTraces(ws: Workspace): ProcessTrace[] {
+  if (!fs.existsSync(ws.sessionDir)) return [];
+  const traces: ProcessTrace[] = [];
+  for (const file of fs.readdirSync(ws.sessionDir)) {
     if (!file.endsWith('.jsonl')) continue;
-    /** @type {ProcessRecord | null} */
-    let header = null;
-    /** @type {MeasureRecord[]} */
-    const measures = [];
-    for (const line of fs.readFileSync(path.join(sessionDir, file), 'utf8').split('\n')) {
+    let header: ProcessRecord | null = null;
+    const measures: MeasureRecord[] = [];
+    for (const line of fs.readFileSync(path.join(ws.sessionDir, file), 'utf8').split('\n')) {
       if (!line.trim()) continue;
       try {
         const record = JSON.parse(line);
@@ -320,8 +384,7 @@ function readTraces() {
   return traces;
 }
 
-/** @param {ProcessRecord} header */
-function classify(header) {
+function classify(header: ProcessRecord): string {
   const script = header.argv[1] ? path.basename(header.argv[1]) : '';
   switch (script) {
     case 'nx.js':
@@ -335,27 +398,21 @@ function classify(header) {
   }
 }
 
-/** @param {string} role */
-const roleKind = (role) => role.split(':')[0];
+const roleKind = (role: string) => role.split(':')[0];
 
 // ---------------------------------------------------------------------------
 // Report
 
-/** @param {number} n */
-const ms = (n) => `${n.toFixed(1)} ms`;
+const ms = (n: number) => `${n.toFixed(1)} ms`;
 
-/** @param {string} s */
-const cell = (s) => s.replace(/\|/g, '\\|').replace(/\n/g, ' ');
+const cell = (s: string) => s.replace(/\|/g, '\\|').replace(/\n/g, ' ');
 
-/**
- * Shortens the workspace-rooted plugin paths nx puts in measure names.
- * @param {string} name
- */
-function shortName(name) {
+/** Shortens the workspace-rooted plugin paths nx puts in measure names. */
+function shortName(root: string, name: string): string {
   return name
-    .split(workspaceRoot + path.sep)
+    .split(root + path.sep)
     .join('')
-    .split(workspaceRoot + '/')
+    .split(root + '/')
     .join('')
     .replace(/node_modules[\\/]nx[\\/]dist[\\/]src[\\/]plugins[\\/]/g, 'nx:')
     .replace(/node_modules[\\/]/g, '');
@@ -378,18 +435,22 @@ const KEY_PHASES = [
   /^REQUEST_PROJECT_GRAPH round trip$/,
 ];
 
-/**
- * @param {object} r
- * @param {Record<string, unknown>} r.system
- * @param {number} r.projectCount
- * @param {number} r.coldGraphMs
- * @param {number[]} r.warmMs
- * @param {ProcessTrace[]} r.traces
- * @param {Record<string, any>} r.report
- * @param {PluginConfigFiles[] | { error: string }} r.pluginConfigFiles
- * @param {ReturnType<typeof readNxJson>} r.nxJson
- */
-function renderMarkdown(r) {
+interface Collected {
+  collectedAt: string;
+  workspaceRoot: string;
+  system: SystemInfo;
+  projectCount: number;
+  coldGraphMs: number;
+  warmMs: number[];
+  warmMedianMs: number | null;
+  records: string | null;
+  traces: ProcessTrace[];
+  report: ReportData;
+  pluginConfigFiles: PluginConfigFiles[] | Failure;
+  nxJson: NxJsonSummary;
+}
+
+function renderMarkdown(r: Collected): string {
   const sys = r.system;
   const summary = md.ul(
     `Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`,
@@ -398,58 +459,18 @@ function renderMarkdown(r) {
     `Warm client round trips: ${r.warmMs.join(', ') || 'none'}${r.warmMs.length ? ` (median ${Math.round(median(r.warmMs))} ms)` : ''}`,
   );
 
-  /** @type {string[]} */
-  const sections = [];
+  const sections: string[] = [];
   if (r.traces.length === 0) {
     sections.push('No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.');
   } else {
-    const earliest = Math.min(...r.traces.map((t) => t.timeOrigin));
-    sections.push(
-      md.h2(
-        'Processes',
-        md.table(r.traces, [
-          { label: 'pid', field: 'pid' },
-          { label: 'role', mapFn: (t) => cell(t.role) },
-          { label: 'parent', field: 'ppid' },
-          { label: 'started at', mapFn: (t) => `+${ms(t.timeOrigin - earliest)}` },
-          { label: 'measures', mapFn: (t) => t.measures.length },
-          {
-            label: 'last measure ends',
-            mapFn: (t) =>
-              `+${ms(t.timeOrigin - earliest + t.measures.reduce((max, m) => Math.max(max, m.startTime + m.duration), 0))}`,
-          },
-        ]),
-      ),
-    );
-
-    /** @type {Map<string, { phase: string, process: string, durations: number[] }>} */
-    const byPhase = new Map();
-    for (const t of r.traces) {
-      for (const m of t.measures) {
-        if (!KEY_PHASES.some((p) => p.test(m.name))) continue;
-        const phase = shortName(m.name);
-        const key = `${phase} ${roleKind(t.role)}`;
-        const entry = byPhase.get(key) ?? { phase, process: roleKind(t.role), durations: [] };
-        entry.durations.push(m.duration);
-        byPhase.set(key, entry);
-      }
-    }
-    const phases = [...byPhase.values()].sort((a, b) => Math.max(...b.durations) - Math.max(...a.durations));
+    sections.push(md.h2('Processes', renderProcesses(r.traces)));
     sections.push(
       md.h2(
         'Key phases',
         'Every occurrence across all processes, so cold and warm runs both show.',
-        md.table(phases, [
-          { label: 'phase', mapFn: (p) => cell(p.phase) },
-          { label: 'process', field: 'process' },
-          { label: 'occurrences', mapFn: (p) => p.durations.length },
-          { label: 'first', mapFn: (p) => ms(p.durations[0]) },
-          { label: 'median', mapFn: (p) => ms(median(p.durations)) },
-          { label: 'max', mapFn: (p) => ms(Math.max(...p.durations)) },
-        ]),
+        renderKeyPhases(r.workspaceRoot, r.traces),
       ),
     );
-
     sections.push(
       md.h2(
         'Timelines',
@@ -460,7 +481,7 @@ function renderMarkdown(r) {
             md.table(t.measures, [
               { label: 'start', mapFn: (m) => `+${ms(m.startTime)}` },
               { label: 'duration', mapFn: (m) => ms(m.duration) },
-              { label: 'measure', mapFn: (m) => cell(shortName(m.name)) },
+              { label: 'measure', mapFn: (m) => cell(shortName(r.workspaceRoot, m.name)) },
             ]),
           ),
         ),
@@ -471,10 +492,11 @@ function renderMarkdown(r) {
   sections.push(md.h2('Plugin config files', ...renderPluginConfigFiles(r.pluginConfigFiles)));
   sections.push(md.h2('nx report', ...renderReport(r.report)));
 
+  const nxJsonKeys = ['plugins', 'targetDefaults', 'namedInputs'] as const;
   sections.push(
     md.h2(
       'nx.json',
-      .../** @type {const} */ (['plugins', 'targetDefaults', 'namedInputs']).map((key) =>
+      ...nxJsonKeys.map((key) =>
         md.h3(
           key,
           md.codeBlock(JSON.stringify('error' in r.nxJson ? r.nxJson.error : (r.nxJson[key] ?? null), null, 2), 'json'),
@@ -486,8 +508,46 @@ function renderMarkdown(r) {
   return md.h1('Nx graph construction', summary, ...sections) + '\n';
 }
 
-/** @param {PluginConfigFiles[] | { error: string }} plugins */
-function renderPluginConfigFiles(plugins) {
+function renderProcesses(traces: ProcessTrace[]): string {
+  const earliest = Math.min(...traces.map((t) => t.timeOrigin));
+  return md.table(traces, [
+    { label: 'pid', field: 'pid' },
+    { label: 'role', mapFn: (t) => cell(t.role) },
+    { label: 'parent', field: 'ppid' },
+    { label: 'started at', mapFn: (t) => `+${ms(t.timeOrigin - earliest)}` },
+    { label: 'measures', mapFn: (t) => t.measures.length },
+    {
+      label: 'last measure ends',
+      mapFn: (t) =>
+        `+${ms(t.timeOrigin - earliest + t.measures.reduce((max, m) => Math.max(max, m.startTime + m.duration), 0))}`,
+    },
+  ]);
+}
+
+function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
+  const byPhase = new Map<string, { phase: string; process: string; durations: number[] }>();
+  for (const t of traces) {
+    for (const m of t.measures) {
+      if (!KEY_PHASES.some((p) => p.test(m.name))) continue;
+      const phase = shortName(root, m.name);
+      const key = `${phase} ${roleKind(t.role)}`;
+      const entry = byPhase.get(key) ?? { phase, process: roleKind(t.role), durations: [] };
+      entry.durations.push(m.duration);
+      byPhase.set(key, entry);
+    }
+  }
+  const phases = [...byPhase.values()].sort((a, b) => Math.max(...b.durations) - Math.max(...a.durations));
+  return md.table(phases, [
+    { label: 'phase', mapFn: (p) => cell(p.phase) },
+    { label: 'process', field: 'process' },
+    { label: 'occurrences', mapFn: (p) => p.durations.length },
+    { label: 'first', mapFn: (p) => ms(p.durations[0]) },
+    { label: 'median', mapFn: (p) => ms(median(p.durations)) },
+    { label: 'max', mapFn: (p) => ms(Math.max(...p.durations)) },
+  ]);
+}
+
+function renderPluginConfigFiles(plugins: PluginConfigFiles[] | Failure): string[] {
   if ('error' in plugins) return [plugins.error];
   const intro =
     "Files matched by each loaded plugin's createNodes glob, by basename. One config file can produce more than one project, so this bounds what a plugin contributes rather than counting its projects.";
@@ -511,11 +571,9 @@ function renderPluginConfigFiles(plugins) {
   ];
 }
 
-/** @param {Record<string, any>} report */
-function renderReport(report) {
+function renderReport(report: ReportData): string[] {
   if ('error' in report) return [String(report.error)];
-  /** @type {string[]} */
-  const parts = [];
+  const parts: string[] = [];
   const daemon =
     'error' in report.daemon
       ? `error: ${report.daemon.error}`
@@ -534,24 +592,23 @@ function renderReport(report) {
     ),
   );
   if (report.projectGraphError) parts.push(md.blockQuote(`Project graph error: ${report.projectGraphError}`));
+  const versions: { package: string; version: string }[] = report.packageVersionsWeCareAbout;
   parts.push(
-    md.table(report.packageVersionsWeCareAbout, [
-      { label: 'package', mapFn: (p) => md.code(String(p.package)) },
+    md.table(versions, [
+      { label: 'package', mapFn: (p) => md.code(p.package) },
       { label: 'version', field: 'version' },
     ]),
   );
-  /** @type {{ kind: string, name: string }[]} */
-  const plugins = [
-    ...report.registeredPlugins.map((/** @type {string} */ name) => ({ kind: 'registered', name })),
-    ...report.localPlugins.map((/** @type {string} */ name) => ({ kind: 'local', name })),
-    ...report.communityPlugins.map((/** @type {{ name: string, version: string }} */ p) => ({
-      kind: 'community',
-      name: `${p.name} ${p.version}`,
-    })),
-    ...report.powerpackPlugins.map((/** @type {{ name: string, version: string }} */ p) => ({
-      kind: 'powerpack',
-      name: `${p.name} ${p.version}`,
-    })),
+  const named = (kind: string) => (name: string) => ({ kind, name });
+  const versioned = (kind: string) => (p: { name: string; version: string }) => ({
+    kind,
+    name: `${p.name} ${p.version}`,
+  });
+  const plugins: { kind: string; name: string }[] = [
+    ...report.registeredPlugins.map(named('registered')),
+    ...report.localPlugins.map(named('local')),
+    ...report.communityPlugins.map(versioned('community')),
+    ...report.powerpackPlugins.map(versioned('powerpack')),
   ];
   if (plugins.length) {
     parts.push(
@@ -566,10 +623,11 @@ function renderReport(report) {
   }
   if (report.outOfSyncPackageGroup) {
     const g = report.outOfSyncPackageGroup;
+    const misaligned: { name: string; version: string }[] = g.misalignedPackages;
     parts.push(
       md.h3(
         `Out of sync with ${g.basePackage}`,
-        md.table(g.misalignedPackages, [
+        md.table(misaligned, [
           { label: 'package', field: 'name' },
           { label: 'version', field: 'version' },
         ]),
@@ -578,10 +636,11 @@ function renderReport(report) {
     );
   }
   if (report.mismatchedNxVersions?.length) {
+    const mismatched: { version: string; chain: string[] }[] = report.mismatchedNxVersions;
     parts.push(
       md.h3(
         'Mismatched nx versions',
-        md.table(/** @type {{ version: string, chain: string[] }[]} */ (report.mismatchedNxVersions), [
+        md.table(mismatched, [
           { label: 'version', field: 'version' },
           { label: 'chain', mapFn: (m) => m.chain.join(' > ') },
         ]),
@@ -593,32 +652,35 @@ function renderReport(report) {
 
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
+/** Collects and writes the report for the workspace at `workspaceRoot`. */
+export async function run(argv: string[], workspaceRoot: string): Promise<void> {
+  const opts = parseArgs(argv);
+  const ws = openWorkspace(workspaceRoot);
   const startedAt = new Date().toISOString();
-  fs.mkdirSync(opts.out, { recursive: true });
+  const outDir = path.resolve(ws.root, opts.out);
+  fs.mkdirSync(outDir, { recursive: true });
 
   if (opts.reset) {
     console.log('nx reset');
-    assertOk('nx reset', nx(['reset']));
+    assertOk('nx reset', nx(ws, ['reset']));
   }
 
-  /** @type {ReturnType<typeof installInstrument>} */
-  let instrument = null;
+  let instrument: Instrument | null = null;
   if (opts.instrument) {
-    const source = opts.instrumentFile ? fs.readFileSync(path.resolve(opts.instrumentFile), 'utf8') : INSTRUMENT_SOURCE;
+    const source = opts.instrumentFile
+      ? fs.readFileSync(path.resolve(opts.instrumentFile), 'utf8')
+      : instrumentSource();
     console.log(`instrumenting nx perf-logging${opts.instrumentFile ? ` from ${opts.instrumentFile}` : ''}`);
-    instrument = installInstrument(source);
-    announceSession();
+    instrument = installInstrument(ws, source);
+    announceSession(ws);
   }
 
   try {
     // First run after a reset starts the daemon and builds the graph from nothing.
     console.log('cold graph construction: nx show projects --json');
-    const cold = nx(['show', 'projects', '--json']);
+    const cold = nx(ws, ['show', 'projects', '--json']);
     assertOk('nx show projects', cold);
-    /** @type {string[]} */
-    let projects = [];
+    let projects: string[] = [];
     try {
       projects = JSON.parse(cold.stdout);
     } catch {
@@ -629,79 +691,55 @@ async function main() {
 
     // Subsequent runs hit the daemon's cached graph; their wall time is the
     // client round trip, which is what a developer feels on every command.
-    /** @type {number[]} */
-    const warmMs = [];
+    const warmMs: number[] = [];
     for (let i = 1; i < opts.runs; i++) {
       console.log(`warm run ${i} of ${opts.runs - 1}`);
-      const warm = nx(['show', 'projects', '--json']);
+      const warm = nx(ws, ['show', 'projects', '--json']);
       assertOk('nx show projects (warm)', warm);
       warmMs.push(warm.wallMs);
     }
 
     // Stop recording before anything that is not graph construction runs.
-    withdrawSession();
-    const traces = instrument ? readTraces() : [];
+    withdrawSession(ws);
+    const traces = instrument ? readTraces(ws) : [];
 
     console.log('nx report data');
-    const report = await readReportData();
+    const report = await readReportData(ws);
     console.log('plugin config files');
-    const pluginConfigFiles = await readPluginConfigFiles();
+    const pluginConfigFiles = await readPluginConfigFiles(ws);
 
-    const system = {
-      platform: process.platform,
-      release: os.release(),
-      arch: process.arch,
-      cpus: os.cpus().length,
-      cpuModel: os.cpus()[0]?.model ?? null,
-      memoryGb: Math.round(os.totalmem() / 1024 ** 3),
-      node: process.version,
-    };
-    const nxJson = readNxJson();
-    const result = {
+    const result: Collected = {
       collectedAt: startedAt,
-      workspaceRoot,
-      system,
+      workspaceRoot: ws.root,
+      system: {
+        platform: process.platform,
+        release: os.release(),
+        arch: process.arch,
+        cpus: os.cpus().length,
+        cpuModel: os.cpus()[0]?.model ?? null,
+        memoryGb: Math.round(os.totalmem() / 1024 ** 3),
+        node: process.version,
+      },
       projectCount: projects.length,
       coldGraphMs: Math.round(cold.wallMs),
       warmMs: warmMs.map(Math.round),
       warmMedianMs: warmMs.length ? Math.round(median(warmMs)) : null,
-      records: instrument ? path.relative(workspaceRoot, sessionDir) : null,
+      records: instrument ? path.relative(ws.root, ws.sessionDir) : null,
       traces,
       report,
       pluginConfigFiles,
-      nxJson,
+      nxJson: readNxJson(ws.root),
     };
 
-    fs.writeFileSync(
-      path.join(opts.out, 'graph-perf.md'),
-      renderMarkdown({
-        system,
-        projectCount: projects.length,
-        coldGraphMs: result.coldGraphMs,
-        warmMs: result.warmMs,
-        traces,
-        report,
-        pluginConfigFiles,
-        nxJson,
-      }),
-    );
-    fs.writeFileSync(path.join(opts.out, 'graph-perf.json'), JSON.stringify(result, null, 2) + '\n');
+    fs.writeFileSync(path.join(outDir, 'graph-perf.md'), renderMarkdown(result));
+    fs.writeFileSync(path.join(outDir, 'graph-perf.json'), JSON.stringify(result, null, 2) + '\n');
 
-    console.log(`wrote ${path.join(opts.out, 'graph-perf.md')} and graph-perf.json`);
+    console.log(`wrote ${path.join(outDir, 'graph-perf.md')} and graph-perf.json`);
     console.log(
       `projects ${projects.length}, cold ${result.coldGraphMs}ms, warm median ${result.warmMedianMs ?? 'n/a'}ms, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`,
     );
   } finally {
-    withdrawSession();
+    withdrawSession(ws);
     instrument?.restore();
   }
 }
-
-main().then(
-  // nx loaded in-process may hold a daemon socket open; do not wait on it.
-  () => process.exit(0),
-  (e) => {
-    console.error(e instanceof Error ? (e.stack ?? e.message) : String(e));
-    process.exit(1);
-  },
-);
