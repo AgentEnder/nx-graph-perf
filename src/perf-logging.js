@@ -17,26 +17,31 @@ function isTrackedDetail(detail) {
   return typeof detail === "object" && detail !== null && detail.track === true;
 }
 
-/** @type {{ file: string | null } | null} */
-let recorder = null;
+let recorder = { session: null, file: null };
+let perfLogsRoot = null;
+
+// Re-reads the marker on every batch: a long-lived daemon outlives the session
+// that started it, and its measures must land with whichever session is active
+// now, or nowhere when none is.
 function getRecorder() {
-  if (recorder) return recorder;
-  recorder = { file: null };
-  try {
-    const { workspaceDataDirectory } = require("./cache-directory");
-    const root = path.join(workspaceDataDirectory, "perf-logs");
-    const marker = path.join(root, "ACTIVE");
-    if (fs.existsSync(marker)) {
-      const session = fs.readFileSync(marker, "utf8").trim();
-      if (session) {
-        const dir = path.join(root, session);
+    try {
+        if (!perfLogsRoot) {
+            const { workspaceDataDirectory } = require('./cache-directory');
+            perfLogsRoot = path.join(workspaceDataDirectory, 'perf-logs');
+        }
+        const marker = path.join(perfLogsRoot, 'ACTIVE');
+        const session = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').trim() : '';
+        if (!session) {
+            recorder = { session: null, file: null };
+            return recorder;
+        }
+        if (recorder.session === session) return recorder;
+        const dir = path.join(perfLogsRoot, session);
         fs.mkdirSync(dir, { recursive: true });
-        recorder.file = path.join(dir, `${process.pid}.jsonl`);
+        const file = path.join(dir, `${process.pid}.jsonl`);
         // Header line, so the file says which process it belongs to.
-        fs.appendFileSync(
-          recorder.file,
-          JSON.stringify({
-            kind: "process",
+        fs.appendFileSync(file, JSON.stringify({
+            kind: 'process',
             pid: process.pid,
             ppid: process.ppid,
             argv: process.argv,
@@ -44,14 +49,12 @@ function getRecorder() {
             cwd: process.cwd(),
             node: process.version,
             timeOrigin: perf_hooks_1.performance.timeOrigin,
-          }) + "\n",
-        );
-      }
+        }) + '\n');
+        recorder = { session, file };
+    } catch {
+        recorder = { session: null, file: null };
     }
-  } catch {
-    recorder.file = null;
-  }
-  return recorder;
+    return recorder;
 }
 
 function safeDetail(detail) {

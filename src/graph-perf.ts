@@ -389,12 +389,15 @@ function readTraces(ws: Workspace, runs: Run[]): ProcessTrace[] {
     }
     if (!header) continue;
     const timeOrigin = header.timeOrigin;
-    // A measure belongs to the timed command that had started most recently
-    // when it began; process time origins and run timestamps share the epoch.
+    // A measure is cold only if it began before the cold command returned;
+    // anything later, including a worker spawned between commands, had the
+    // on-disk cache. Process time origins and run timestamps share the epoch.
+    const cold = runs[0];
     const measures: MeasureRecord[] = raw.map((m) => {
       const at = timeOrigin + m.startTime;
-      const run = runs.reduce((current, r) => (r.startedAt <= at ? r : current), runs[0]);
-      return { ...m, phase: run.phase, run: run.index };
+      if (at <= cold.endedAt) return { ...m, phase: 'cold', run: cold.index };
+      const run = runs.reduce((current, r) => (r.startedAt <= at ? r : current), runs[1] ?? cold);
+      return { ...m, phase: 'warm', run: run.index };
     });
     measures.sort((a, b) => a.startTime - b.startTime);
     traces.push({
@@ -517,6 +520,7 @@ interface Collected {
   coldGraphMs: number;
   warmMs: number[];
   warmMedianMs: number | null;
+  reset: boolean;
   runs: Run[];
   records: string | null;
   traces: ProcessTrace[];
@@ -532,6 +536,7 @@ function renderMarkdown(r: Collected): string {
     `Projects: ${r.projectCount}`,
     `Cold ${md.code('nx show projects')} after ${md.code('nx reset')}: ${r.coldGraphMs} ms`,
     `Warm runs: ${r.warmMs.join(', ') || 'none'}${r.warmMs.length ? ` ms (median ${Math.round(median(r.warmMs))} ms)` : ''}`,
+    ...(r.reset ? [] : ['Daemon was not reset, so the cold run is only cold if no daemon was running.']),
   );
 
   const sections: string[] = [];
@@ -774,6 +779,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
       coldGraphMs: Math.round(cold.wallMs),
       warmMs: warmMs.map(Math.round),
       warmMedianMs: warmMs.length ? Math.round(median(warmMs)) : null,
+      reset: opts.reset,
       runs,
       records: instrument ? path.relative(ws.root, ws.sessionDir) : null,
       traces,
