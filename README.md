@@ -40,7 +40,8 @@ The script writes `graph-perf.md` and `graph-perf.json` next to where it ran. Se
 2. Replaces `node_modules/nx/dist/src/utils/perf-logging.js` with an instrumented copy that also appends each measure to `.nx/workspace-data/perf-logs/<pid>/<process pid>.jsonl`. The original is backed up and put back when the script exits, including on failure.
 3. Runs `nx show projects --json` once cold (daemon start and full graph construction) and then two more times warm (daemon round trip only).
 4. Reads the recorded measures, the data behind `nx report`, and the `plugins`, `targetDefaults` and `namedInputs` blocks of `nx.json`.
-5. Writes the report.
+5. Loads the workspace's plugins the way nx does and counts the files each plugin's `createNodes` glob matches.
+6. Writes the report.
 
 The daemon is forced on (`NX_DAEMON=true`) because Nx disables it under CI and inside Docker, and a daemonless run measures something else.
 
@@ -60,6 +61,7 @@ The daemon is forced on (`NX_DAEMON=true`) because Nx disables it under CI and i
 - A table of every Nx process that ran, with its role and when it started.
 - Key phases across all processes: plugin loading, worker startup, `createNodes`, `createDependencies`, graph serialization, and the client round trip.
 - A full timeline per process.
+- Per plugin, the files its `createNodes` glob matches, counted by basename. A config file can produce more than one project, so this bounds what a plugin contributes rather than counting its projects.
 - The `nx report` data as tables.
 - The graph-relevant parts of `nx.json`.
 

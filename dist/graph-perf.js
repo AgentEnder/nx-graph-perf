@@ -148,7 +148,7 @@ var overrides = {
 var { CI: _ci, ...inheritedEnv } = process.env;
 var env = { ...inheritedEnv, ...overrides };
 delete process.env.CI;
-Object.assign(process.env, overrides);
+Object.assign(process.env, { NX_DAEMON: overrides.NX_DAEMON, NX_TUI: overrides.NX_TUI });
 function resolveFromWorkspace(request) {
   try {
     return require.resolve(request, { paths: [workspaceRoot] });
@@ -206,8 +206,11 @@ function readNxJson() {
     return { error: `nx.json unreadable: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
+function resolveNxInternal(rel) {
+  return resolveFromWorkspace(`nx/dist/src/${rel}`) ?? resolveFromWorkspace(`nx/src/${rel}`);
+}
 async function readReportData() {
-  const module2 = resolveFromWorkspace("nx/dist/src/command-line/report/report") ?? resolveFromWorkspace("nx/src/command-line/report/report");
+  const module2 = resolveNxInternal("command-line/report/report");
   if (!module2) return { error: "nx report module not found" };
   try {
     const { getReportData } = require(module2);
@@ -221,8 +224,48 @@ async function readReportData() {
     return { error: `getReportData failed: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
+async function readPluginConfigFiles() {
+  const getPlugins = resolveNxInternal("project-graph/plugins/get-plugins");
+  const workspaceContext = resolveNxInternal("utils/workspace-context");
+  const nxJsonModule = resolveNxInternal("config/nx-json");
+  const configUtils = resolveNxInternal("project-graph/utils/project-configuration-utils");
+  if (!getPlugins || !workspaceContext || !nxJsonModule || !configUtils) {
+    return { error: "nx plugin loading internals not found in this nx version" };
+  }
+  try {
+    const { getPlugins: loadPlugins, cleanupPlugins } = require(getPlugins);
+    const { globWithWorkspaceContextSync } = require(workspaceContext);
+    const { readNxJson: readNxJson2 } = require(nxJsonModule);
+    const { findMatchingConfigFiles } = require(configUtils);
+    const plugins = await loadPlugins(readNxJson2(workspaceRoot), workspaceRoot);
+    const result = [];
+    for (const plugin of plugins) {
+      if (!plugin.createNodes) continue;
+      const pattern = plugin.createNodes[0];
+      const candidates = globWithWorkspaceContextSync(workspaceRoot, [pattern]);
+      const matched = findMatchingConfigFiles(candidates, plugin.include, plugin.exclude);
+      const counts = /* @__PURE__ */ new Map();
+      for (const file of matched) {
+        const base = import_node_path.default.basename(file);
+        counts.set(base, (counts.get(base) ?? 0) + 1);
+      }
+      result.push({
+        name: plugin.name,
+        pattern,
+        include: plugin.include ?? null,
+        exclude: plugin.exclude ?? null,
+        total: matched.length,
+        files: [...counts.entries()].map(([file, count]) => ({ file, count })).sort((a, b) => b.count - a.count || a.file.localeCompare(b.file))
+      });
+    }
+    cleanupPlugins?.();
+    return result;
+  } catch (e) {
+    return { error: `plugin inspection failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
 function installInstrument(source) {
-  const target = resolveFromWorkspace("nx/dist/src/utils/perf-logging.js") ?? resolveFromWorkspace("nx/src/utils/perf-logging.js");
+  const target = resolveNxInternal("utils/perf-logging.js");
   if (!target) {
     console.warn("could not locate nx perf-logging module; running without instrumentation");
     return null;
@@ -325,9 +368,7 @@ function renderMarkdown(r) {
   );
   const sections = [];
   if (r.traces.length === 0) {
-    sections.push(
-      "No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module."
-    );
+    sections.push("No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.");
   } else {
     const earliest = Math.min(...r.traces.map((t) => t.timeOrigin));
     sections.push(
@@ -357,9 +398,7 @@ function renderMarkdown(r) {
         byPhase.set(key, entry);
       }
     }
-    const phases = [...byPhase.values()].sort(
-      (a, b) => Math.max(...b.durations) - Math.max(...a.durations)
-    );
+    const phases = [...byPhase.values()].sort((a, b) => Math.max(...b.durations) - Math.max(...a.durations));
     sections.push(
       h2(
         "Key phases",
@@ -391,6 +430,7 @@ function renderMarkdown(r) {
       )
     );
   }
+  sections.push(h2("Plugin config files", ...renderPluginConfigFiles(r.pluginConfigFiles)));
   sections.push(h2("nx report", ...renderReport(r.report)));
   sections.push(
     h2(
@@ -399,15 +439,32 @@ function renderMarkdown(r) {
       ["plugins", "targetDefaults", "namedInputs"].map(
         (key) => h3(
           key,
-          codeBlock(
-            JSON.stringify("error" in r.nxJson ? r.nxJson.error : r.nxJson[key] ?? null, null, 2),
-            "json"
-          )
+          codeBlock(JSON.stringify("error" in r.nxJson ? r.nxJson.error : r.nxJson[key] ?? null, null, 2), "json")
         )
       )
     )
   );
   return h1("Nx graph construction", summary, ...sections) + "\n";
+}
+function renderPluginConfigFiles(plugins) {
+  if ("error" in plugins) return [plugins.error];
+  const intro = "Files matched by each loaded plugin's createNodes glob, by basename. One config file can produce more than one project, so this bounds what a plugin contributes rather than counting its projects.";
+  return [
+    intro,
+    ...plugins.map((p) => {
+      const scope = [`Pattern: ${code(p.pattern)}`];
+      if (p.include?.length) scope.push(`Include: ${p.include.map(code).join(", ")}`);
+      if (p.exclude?.length) scope.push(`Exclude: ${p.exclude.map(code).join(", ")}`);
+      return h3(
+        p.name,
+        scope.join(" "),
+        p.files.length ? table(p.files, [
+          { label: "file", mapFn: (f) => code(f.file) },
+          { label: "count", field: "count" }
+        ]) : "No matching files."
+      );
+    })
+  ];
 }
 function renderReport(report) {
   if ("error" in report) return [String(report.error)];
@@ -422,8 +479,7 @@ function renderReport(report) {
       `Nx key: ${report.nxKey ? report.nxKey.licenseType ?? "present" : report.nxKeyError ? `error: ${report.nxKeyError}` : "none"}`
     )
   );
-  if (report.projectGraphError)
-    parts.push(blockQuote(`Project graph error: ${report.projectGraphError}`));
+  if (report.projectGraphError) parts.push(blockQuote(`Project graph error: ${report.projectGraphError}`));
   parts.push(
     table(report.packageVersionsWeCareAbout, [
       { label: "package", mapFn: (p) => code(String(p.package)) },
@@ -494,9 +550,7 @@ async function main() {
   let instrument = null;
   if (opts.instrument) {
     const source = opts.instrumentFile ? import_node_fs.default.readFileSync(import_node_path.default.resolve(opts.instrumentFile), "utf8") : perf_logging_default;
-    console.log(
-      `instrumenting nx perf-logging${opts.instrumentFile ? ` from ${opts.instrumentFile}` : ""}`
-    );
+    console.log(`instrumenting nx perf-logging${opts.instrumentFile ? ` from ${opts.instrumentFile}` : ""}`);
     instrument = installInstrument(source);
     announceSession();
   }
@@ -523,6 +577,8 @@ async function main() {
     const traces = instrument ? readTraces() : [];
     console.log("nx report data");
     const report = await readReportData();
+    console.log("plugin config files");
+    const pluginConfigFiles = await readPluginConfigFiles();
     const system = {
       platform: process.platform,
       release: import_node_os.default.release(),
@@ -544,6 +600,7 @@ async function main() {
       records: instrument ? import_node_path.default.relative(workspaceRoot, sessionDir) : null,
       traces,
       report,
+      pluginConfigFiles,
       nxJson
     };
     import_node_fs.default.writeFileSync(
@@ -555,13 +612,11 @@ async function main() {
         warmMs: result.warmMs,
         traces,
         report,
+        pluginConfigFiles,
         nxJson
       })
     );
-    import_node_fs.default.writeFileSync(
-      import_node_path.default.join(opts.out, "graph-perf.json"),
-      JSON.stringify(result, null, 2) + "\n"
-    );
+    import_node_fs.default.writeFileSync(import_node_path.default.join(opts.out, "graph-perf.json"), JSON.stringify(result, null, 2) + "\n");
     console.log(`wrote ${import_node_path.default.join(opts.out, "graph-perf.md")} and graph-perf.json`);
     console.log(
       `projects ${projects.length}, cold ${result.coldGraphMs}ms, warm median ${result.warmMedianMs ?? "n/a"}ms, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`
