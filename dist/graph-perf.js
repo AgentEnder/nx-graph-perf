@@ -503,7 +503,7 @@ function readTraces(ws) {
 		traces.push({
 			pid: header.pid,
 			ppid: header.ppid,
-			role: classify(header),
+			role: classify(ws.root, header),
 			argv: header.argv,
 			timeOrigin: header.timeOrigin,
 			measures
@@ -512,16 +512,36 @@ function readTraces(ws) {
 	traces.sort((a, b) => a.timeOrigin - b.timeOrigin);
 	return traces;
 }
-function classify(header) {
+function classify(root, header) {
 	const script = header.argv[1] ? node_path.default.basename(header.argv[1]) : "";
 	switch (script) {
 		case "nx.js": return `client: nx ${header.argv.slice(2).join(" ")}`.trim();
 		case "start.js": return "daemon";
-		case "plugin-worker.js": return "plugin worker";
+		case "plugin-worker.js": {
+			const plugin = header.argv[3];
+			return plugin ? `plugin worker: ${shortName(root, plugin)}` : "plugin worker";
+		}
 		default: return script || "unknown";
 	}
 }
 const roleKind = (role) => role.split(":")[0];
+/**
+* Sum of the measures that are not fully inside another measure of the same
+* process. Nested phases (a plugin's createNodes inside the daemon's graph
+* construction, say) are counted once, through the measure that contains them.
+*/
+function topLevelMs(measures) {
+	const ordered = [...measures].sort((a, b) => a.startTime - b.startTime || b.duration - a.duration);
+	let outerEnd = -Infinity;
+	let sum = 0;
+	for (const m of ordered) {
+		const end = m.startTime + m.duration;
+		if (end <= outerEnd) continue;
+		outerEnd = end;
+		sum += m.duration;
+	}
+	return sum;
+}
 const ms = (n) => `${n.toFixed(1)} ms`;
 const cell = (s) => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
 /** Shortens the workspace-rooted plugin paths nx puts in measure names. */
@@ -550,7 +570,7 @@ function renderMarkdown(r) {
 	const sections = [];
 	if (r.traces.length === 0) sections.push("No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.");
 	else {
-		sections.push(h2("Processes", renderProcesses(r.traces)));
+		sections.push(h2("Processes", renderProcesses(r.traces), "The top-level sum adds up the measures of a process that are not fully inside another of its measures, so nested phases count once. For a plugin worker that is roughly what the plugin cost."));
 		sections.push(h2("Key phases", "Every occurrence across all processes, so cold and warm runs both show.", renderKeyPhases(r.workspaceRoot, r.traces)));
 		sections.push(h2("Timelines", "Offsets are from each process start. Every recorded measure, in start order.", ...r.traces.map((t) => h3(`${t.role}, pid ${t.pid}`, table(t.measures, [
 			{
@@ -598,6 +618,10 @@ function renderProcesses(traces) {
 		{
 			label: "measures",
 			mapFn: (t) => t.measures.length
+		},
+		{
+			label: "top-level sum",
+			mapFn: (t) => ms(topLevelMs(t.measures))
 		},
 		{
 			label: "last measure ends",

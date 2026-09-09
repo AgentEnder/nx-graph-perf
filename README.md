@@ -75,7 +75,7 @@ The daemon is forced on (`NX_DAEMON=true`) because Nx disables it under CI and i
 ## What the report contains
 
 - Platform, project count, cold and warm wall times.
-- A table of every Nx process that ran, with its role and when it started.
+- A table of every Nx process that ran: its role (plugin workers are labelled with their plugin), when it started, and the sum of its top-level measures. Nested phases count once through the measure that contains them, so a plugin worker's sum is roughly what that plugin cost.
 - Key phases across all processes: plugin loading, worker startup, `createNodes`, `createDependencies`, graph serialization, and the client round trip.
 - A full timeline per process.
 - Per plugin, the files its `createNodes` glob matches, counted by basename. A config file can produce more than one project, so this bounds what a plugin contributes rather than counting its projects.
