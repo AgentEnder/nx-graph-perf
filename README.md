@@ -77,7 +77,7 @@ The daemon is forced on (`NX_DAEMON=true`) because Nx disables it under CI and i
 ## What the report contains
 
 - Platform, project count, and the cold, warm and semi-warm wall times of every cycle with their medians.
-- One row per kind of Nx process (client, daemon, each plugin worker labelled with its plugin) across all cycles, with the sum of its top-level measures per cold, warm and semi-warm run. Nested measures count once, so a plugin worker's row is roughly what that plugin cost.
+- One row per kind of Nx process (client, daemon, each plugin worker labelled with its plugin) across all cycles, with the sum of its top-level measures per cold, warm and semi-warm run. Nested measures count once, so a plugin worker's row is roughly what that plugin cost. A plugin registered more than once in `nx.json` gets a row per entry, labelled with the entry's position; nx starts workers in that order and numbers their sockets, which is how the rows are told apart.
 - One row per semi-warm edit: the file, the plugin whose glob matched it, how many times it ran, and the median client and daemon time.
 - Key phases with the cold, warm and semi-warm medians and the warm max: plugin loading, worker startup, `createNodes`, `createDependencies`, graph serialization, and the client round trip. A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.
 - Per plugin, the files its `createNodes` glob matches, counted by basename. A config file can produce more than one project, so this bounds a plugin's share rather than counting its projects.

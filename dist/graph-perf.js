@@ -424,7 +424,9 @@ async function readPluginConfigFiles(ws) {
 		const plugins = await loadPlugins(readNxJson(root), root);
 		const result = [];
 		const matchedByPlugin = /* @__PURE__ */ new Map();
+		const entries = /* @__PURE__ */ new Map();
 		for (const plugin of plugins) {
+			entries.set(plugin.name, [...entries.get(plugin.name) ?? [], plugin.index ?? null]);
 			if (!plugin.createNodes) continue;
 			const pattern = plugin.createNodes[0];
 			const matched = findMatchingConfigFiles(globWithWorkspaceContextSync(root, [pattern]), plugin.include, plugin.exclude);
@@ -436,6 +438,7 @@ async function readPluginConfigFiles(ws) {
 			}
 			result.push({
 				name: plugin.name,
+				index: plugin.index ?? null,
 				pattern,
 				include: plugin.include ?? null,
 				exclude: plugin.exclude ?? null,
@@ -449,7 +452,8 @@ async function readPluginConfigFiles(ws) {
 		cleanupPlugins?.();
 		return {
 			summary: result,
-			matched: matchedByPlugin
+			matched: matchedByPlugin,
+			entries
 		};
 	} catch (e) {
 		return { error: `plugin inspection failed: ${errorMessage(e)}` };
@@ -569,7 +573,36 @@ function withdrawSession(ws) {
 	const marker = markerFor(ws);
 	if (marker) node_fs.default.rmSync(marker, { force: true });
 }
-function readTraces(ws, runs) {
+/**
+* Two nx.json entries for one plugin spawn two workers with the same name.
+* Nx starts and restarts workers in nx.json order, and the socket path it
+* hands each worker carries a base36 spawn counter, so within one host the
+* k-th worker of a name is the k-th entry of that name.
+*/
+function labelPluginInstances(traces, entries) {
+	const spawnCounter = (t) => {
+		const match = /(\d+)-([0-9a-z]+)-[0-9a-f]{8}/.exec(t.argv[2] ?? "");
+		return match ? parseInt(match[2], 36) : Number.MAX_SAFE_INTEGER;
+	};
+	const groups = /* @__PURE__ */ new Map();
+	for (const t of traces) {
+		if (roleKind(t.role) !== "plugin worker") continue;
+		const name = t.role.slice(15);
+		if ((entries.get(name)?.length ?? 0) < 2) continue;
+		const key = `${t.ppid} ${name}`;
+		groups.set(key, [...groups.get(key) ?? [], t]);
+	}
+	for (const [key, workers] of groups) {
+		const name = key.slice(key.indexOf(" ") + 1);
+		const indexes = entries.get(name);
+		workers.sort((a, b) => spawnCounter(a) - spawnCounter(b));
+		workers.forEach((t, k) => {
+			const index = indexes[k % indexes.length];
+			if (index !== null) t.role = `${t.role} (plugins[${index}])`;
+		});
+	}
+}
+function readTraces(ws, runs, entries) {
 	if (!node_fs.default.existsSync(ws.sessionDir)) return [];
 	const traces = [];
 	for (const file of node_fs.default.readdirSync(ws.sessionDir)) {
@@ -607,6 +640,7 @@ function readTraces(ws, runs) {
 		});
 	}
 	traces.sort((a, b) => a.timeOrigin - b.timeOrigin);
+	labelPluginInstances(traces, entries);
 	return traces;
 }
 function classify(root, header) {
@@ -712,7 +746,7 @@ function renderMarkdown(r) {
 	const sections = [];
 	if (r.traces.length === 0) sections.push("No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.");
 	else {
-		sections.push(h2("Processes", renderProcesses(r.traces, r.runs), `One row per kind of process, across every cycle. Sums count nested measures once, through the outermost one, and are per run of that phase (${countBy(r.runs, "cold")} cold, ${countBy(r.runs, "warm")} warm, ${countBy(r.runs, "semi-warm")} semi-warm). Every measure is in graph-perf.json.`));
+		sections.push(h2("Processes", renderProcesses(r.traces, r.runs), `One row per kind of process, across every cycle. Sums count nested measures once, through the outermost one, and are per run of that phase (${countBy(r.runs, "cold")} cold, ${countBy(r.runs, "warm")} warm, ${countBy(r.runs, "semi-warm")} semi-warm). Workers of a plugin registered more than once are told apart by their nx.json position, matched through spawn order. Every measure is in graph-perf.json.`));
 		if (r.edits.length) sections.push(h2("Semi-warm runs", "One edit per plugin whose glob matched a file, then source-file edits, repeated every cycle. Daemon is the sum of its top-level measures inside that run.", renderSemiWarmRuns(r)));
 		sections.push(h2("Key phases", "A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.", renderKeyPhases(r.workspaceRoot, r.traces)));
 	}
@@ -902,7 +936,7 @@ function renderPluginConfigFiles(plugins) {
 		const scope = [`Pattern: ${code(p.pattern)}`];
 		if (p.include?.length) scope.push(`Include: ${p.include.map(code).join(", ")}`);
 		if (p.exclude?.length) scope.push(`Exclude: ${p.exclude.map(code).join(", ")}`);
-		return h3(p.name, scope.join(" "), p.files.length ? table(p.files, [{
+		return h3(p.index === null ? p.name : `${p.name}, nx.json plugins[${p.index}]`, scope.join(" "), p.files.length ? table(p.files, [{
 			label: "file",
 			mapFn: (f) => code(f.file)
 		}, {
@@ -1037,7 +1071,7 @@ async function run(argv, workspaceRoot) {
 			withdrawSession(ws);
 		}
 		if (instrument) {
-			traces.push(...readTraces(ws, runs));
+			traces.push(...readTraces(ws, runs, "error" in inspection ? /* @__PURE__ */ new Map() : inspection.entries));
 			node_fs.default.rmSync(ws.sessionDir, {
 				recursive: true,
 				force: true

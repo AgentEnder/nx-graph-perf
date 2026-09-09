@@ -103,6 +103,8 @@ type ProcessTrace = {
 
 type PluginConfigFiles = {
   name: string;
+  /** Position in nx.json's plugins array; null for nx's built-in plugins. */
+  index: number | null;
   pattern: string;
   include: string[] | null;
   exclude: string[] | null;
@@ -317,6 +319,7 @@ async function readReportData(ws: Workspace): Promise<ReportData> {
 
 interface LoadedPlugin {
   name: string;
+  index?: number;
   createNodes?: [pattern: string, fn: unknown];
   include?: string[];
   exclude?: string[];
@@ -332,6 +335,8 @@ interface PluginInspection {
   summary: PluginConfigFiles[];
   /** Plugin name to every file its glob matched, for choosing edits. */
   matched: Map<string, string[]>;
+  /** Plugin name to the nx.json indexes of its entries, in load order. */
+  entries: Map<string, (number | null)[]>;
 }
 
 async function readPluginConfigFiles(ws: Workspace): Promise<PluginInspection | Failure> {
@@ -351,7 +356,9 @@ async function readPluginConfigFiles(ws: Workspace): Promise<PluginInspection | 
     const plugins: LoadedPlugin[] = await loadPlugins(readNxJson(root), root);
     const result: PluginConfigFiles[] = [];
     const matchedByPlugin = new Map<string, string[]>();
+    const entries = new Map<string, (number | null)[]>();
     for (const plugin of plugins) {
+      entries.set(plugin.name, [...(entries.get(plugin.name) ?? []), plugin.index ?? null]);
       if (!plugin.createNodes) continue;
       const pattern = plugin.createNodes[0];
       const candidates: string[] = globWithWorkspaceContextSync(root, [pattern]);
@@ -364,6 +371,7 @@ async function readPluginConfigFiles(ws: Workspace): Promise<PluginInspection | 
       }
       result.push({
         name: plugin.name,
+        index: plugin.index ?? null,
         pattern,
         include: plugin.include ?? null,
         exclude: plugin.exclude ?? null,
@@ -374,7 +382,7 @@ async function readPluginConfigFiles(ws: Workspace): Promise<PluginInspection | 
       });
     }
     cleanupPlugins?.();
-    return { summary: result, matched: matchedByPlugin };
+    return { summary: result, matched: matchedByPlugin, entries };
   } catch (e) {
     return { error: `plugin inspection failed: ${errorMessage(e)}` };
   }
@@ -509,7 +517,37 @@ function withdrawSession(ws: Workspace): void {
   if (marker) fs.rmSync(marker, { force: true });
 }
 
-function readTraces(ws: Workspace, runs: Run[]): ProcessTrace[] {
+/**
+ * Two nx.json entries for one plugin spawn two workers with the same name.
+ * Nx starts and restarts workers in nx.json order, and the socket path it
+ * hands each worker carries a base36 spawn counter, so within one host the
+ * k-th worker of a name is the k-th entry of that name.
+ */
+function labelPluginInstances(traces: ProcessTrace[], entries: Map<string, (number | null)[]>): void {
+  const spawnCounter = (t: ProcessTrace) => {
+    const match = /(\d+)-([0-9a-z]+)-[0-9a-f]{8}/.exec(t.argv[2] ?? '');
+    return match ? parseInt(match[2], 36) : Number.MAX_SAFE_INTEGER;
+  };
+  const groups = new Map<string, ProcessTrace[]>();
+  for (const t of traces) {
+    if (roleKind(t.role) !== 'plugin worker') continue;
+    const name = t.role.slice('plugin worker: '.length);
+    if ((entries.get(name)?.length ?? 0) < 2) continue;
+    const key = `${t.ppid} ${name}`;
+    groups.set(key, [...(groups.get(key) ?? []), t]);
+  }
+  for (const [key, workers] of groups) {
+    const name = key.slice(key.indexOf(' ') + 1);
+    const indexes = entries.get(name)!;
+    workers.sort((a, b) => spawnCounter(a) - spawnCounter(b));
+    workers.forEach((t, k) => {
+      const index = indexes[k % indexes.length];
+      if (index !== null) t.role = `${t.role} (plugins[${index}])`;
+    });
+  }
+}
+
+function readTraces(ws: Workspace, runs: Run[], entries: Map<string, (number | null)[]>): ProcessTrace[] {
   if (!fs.existsSync(ws.sessionDir)) return [];
   const traces: ProcessTrace[] = [];
   for (const file of fs.readdirSync(ws.sessionDir)) {
@@ -549,6 +587,7 @@ function readTraces(ws: Workspace, runs: Run[]): ProcessTrace[] {
     });
   }
   traces.sort((a, b) => a.timeOrigin - b.timeOrigin);
+  labelPluginInstances(traces, entries);
   return traces;
 }
 
@@ -704,7 +743,7 @@ function renderMarkdown(r: Collected): string {
       md.h2(
         'Processes',
         renderProcesses(r.traces, r.runs),
-        `One row per kind of process, across every cycle. Sums count nested measures once, through the outermost one, and are per run of that phase (${countBy(r.runs, 'cold')} cold, ${countBy(r.runs, 'warm')} warm, ${countBy(r.runs, 'semi-warm')} semi-warm). Every measure is in graph-perf.json.`,
+        `One row per kind of process, across every cycle. Sums count nested measures once, through the outermost one, and are per run of that phase (${countBy(r.runs, 'cold')} cold, ${countBy(r.runs, 'warm')} warm, ${countBy(r.runs, 'semi-warm')} semi-warm). Workers of a plugin registered more than once are told apart by their nx.json position, matched through spawn order. Every measure is in graph-perf.json.`,
       ),
     );
     if (r.edits.length) {
@@ -884,7 +923,7 @@ function renderPluginConfigFiles(plugins: PluginConfigFiles[] | Failure): string
       if (p.include?.length) scope.push(`Include: ${p.include.map(md.code).join(', ')}`);
       if (p.exclude?.length) scope.push(`Exclude: ${p.exclude.map(md.code).join(', ')}`);
       return md.h3(
-        p.name,
+        p.index === null ? p.name : `${p.name}, nx.json plugins[${p.index}]`,
         scope.join(' '),
         p.files.length
           ? md.table(p.files, [
@@ -1055,7 +1094,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
       withdrawSession(ws);
     }
     if (instrument) {
-      traces.push(...readTraces(ws, runs));
+      traces.push(...readTraces(ws, runs, 'error' in inspection ? new Map() : inspection.entries));
       fs.rmSync(ws.sessionDir, { recursive: true, force: true });
     }
 
