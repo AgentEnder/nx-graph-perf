@@ -8,7 +8,8 @@
   "scripts": {
     "build": "node build.mjs",
     "check": "tsc -p tsconfig.json",
-    "fixture": "node scripts/make-fixture.js"
+    "fixture": "node scripts/make-fixture.js",
+    "collect": "node scripts/run.js"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -34,6 +34,22 @@ curl -fsSL https://raw.githubusercontent.com/AgentEnder/nx-graph-perf/main/dist/
 
 The script writes `graph-perf.md` and `graph-perf.json` next to where it ran. Send both. Delete `graph-perf.js` afterwards, or add all three files to `.gitignore`.
 
+## Run it from a clone
+
+If you would rather read the code before running it, clone the repo and point the runner at your workspace. Nothing needs installing: `dist/graph-perf.js` is committed and the runner uses only Node built-ins.
+
+```sh
+git clone https://github.com/AgentEnder/nx-graph-perf.git
+cd nx-graph-perf
+node scripts/run.js /path/to/your/workspace
+```
+
+`npm run collect -- /path/to/your/workspace` does the same. Any further arguments are passed through, for example `node scripts/run.js ../my-workspace --runs 5`.
+
+The report lands in `reports/<workspace name>/` inside the clone, so the workspace itself is left as it was apart from the daemon reset. Pass `--out` to put it elsewhere.
+
+The source is in `src/`. `dist/graph-perf.js` is the same code bundled with its one dependency, [markdown-factory](https://github.com/AgentEnder/markdown-factory); `npm install && npm run build` reproduces it.
+
 ## What it does
 
 1. Runs `nx reset` so the daemon starts fresh.
@@ -77,4 +93,4 @@ npm run build   # bundle src/ into dist/graph-perf.js
 
 `dist/graph-perf.js` is committed so the curl commands above work without a build step. Rebuild and commit it with any change to `src/`.
 
-`npm run fixture -- <dir> [projects] [nxVersion]` generates a throwaway workspace for trying the script.
+`npm run fixture -- <dir> [projects] [nxVersion]` generates a throwaway workspace for trying the script, and `npm run collect -- <dir>` runs the bundle against it.

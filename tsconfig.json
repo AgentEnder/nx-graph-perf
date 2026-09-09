@@ -10,5 +10,5 @@
     "types": ["node"],
     "skipLibCheck": true
   },
-  "include": ["src/graph-perf.js", "src/types.d.ts", "build.mjs", "scripts/make-fixture.js"]
+  "include": ["src/graph-perf.js", "src/types.d.ts", "build.mjs", "scripts/make-fixture.js", "scripts/run.js"]
 }
