@@ -1,15 +1,13 @@
 {
   "$schema": "./node_modules/nx/schemas/nx-schema.json",
+  "analytics": false,
   "targetDefaults": {
     "build": {
       "cache": true,
-      "outputs": [
-        "{projectRoot}/dist"
-      ]
+      "outputs": ["{projectRoot}/dist"]
     },
     "typecheck": {
       "cache": true
     }
-  },
-  "analytics": true
+  }
 }
