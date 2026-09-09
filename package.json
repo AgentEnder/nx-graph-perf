@@ -1,0 +1,20 @@
+{
+  "name": "nx-graph-perf",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Collect Nx project graph construction timings, per process, into a markdown report",
+  "license": "MIT",
+  "repository": "github:AgentEnder/nx-graph-perf",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc -p tsconfig.json",
+    "fixture": "node scripts/make-fixture.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "markdown-factory": "^1.0.0",
+    "nx": "latest",
+    "typescript": "^5.6.0"
+  }
+}
