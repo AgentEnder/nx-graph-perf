@@ -35,6 +35,8 @@ import { instrumentSource } from './instrument';
 
 interface Options {
   runs: number;
+  edits: number;
+  editFile: string | null;
   out: string;
   reset: boolean;
   instrument: boolean;
@@ -64,7 +66,8 @@ type MeasureRecord = {
   run: number;
 };
 
-type Phase = 'cold' | 'warm';
+/** cold: first build after reset. warm: nothing changed. semi-warm: a file in a project was just edited. */
+type Phase = 'cold' | 'warm' | 'semi-warm';
 
 interface Run {
   index: number;
@@ -72,6 +75,12 @@ interface Run {
   startedAt: number;
   endedAt: number;
   wallMs: number;
+}
+
+interface Edit {
+  file: string;
+  touch(): void;
+  restore(): void;
 }
 
 type ProcessTrace = {
@@ -141,17 +150,28 @@ const ENV_OVERRIDES = {
 const INJECTED_BY_NX = new Set(['NX_ANALYTICS_SESSION_ID', 'NX_USE_V8_SERIALIZER']);
 
 function parseArgs(argv: string[]): Options {
-  const opts: Options = { runs: 3, out: '.', reset: true, instrument: true, instrumentFile: null };
+  const opts: Options = {
+    runs: 3,
+    edits: 1,
+    editFile: null,
+    out: '.',
+    reset: true,
+    instrument: true,
+    instrumentFile: null,
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--runs') opts.runs = Math.max(1, Number(argv[++i]));
+    else if (arg === '--edits') opts.edits = Math.max(0, Number(argv[++i]));
+    else if (arg === '--edit-file') opts.editFile = argv[++i];
+    else if (arg === '--no-edit') opts.edits = 0;
     else if (arg === '--out') opts.out = argv[++i];
     else if (arg === '--no-reset') opts.reset = false;
     else if (arg === '--no-instrument') opts.instrument = false;
     else if (arg === '--instrument') opts.instrumentFile = argv[++i];
     else if (arg === '--help' || arg === '-h') {
       console.log(
-        'usage: node graph-perf.js [--runs N] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]',
+        'usage: node graph-perf.js [--runs N] [--edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]',
       );
       process.exit(0);
     } else {
@@ -340,6 +360,66 @@ async function readPluginConfigFiles(ws: Workspace): Promise<PluginConfigFiles[]
 }
 
 // ---------------------------------------------------------------------------
+// Semi-warm runs: edit a file in a project, then ask for the graph again.
+
+const NOT_A_SOURCE_EDIT = new Set([
+  'project.json',
+  'package.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'bun.lock',
+  'bun.lockb',
+]);
+
+/**
+ * A random file of a random project, from the file map the daemon wrote during
+ * the cold run. Config and lock files are skipped so the edit is the ordinary
+ * kind: a source change that touches hashes and dependencies, not project
+ * discovery.
+ */
+function pickEditTarget(ws: Workspace): string | null {
+  const fileMap = path.join(ws.root, '.nx', 'workspace-data', 'file-map.json');
+  if (!fs.existsSync(fileMap)) return null;
+  try {
+    const projectFileMap: Record<string, { file: string }[]> = JSON.parse(fs.readFileSync(fileMap, 'utf8')).fileMap
+      .projectFileMap;
+    const candidates = Object.values(projectFileMap)
+      .map((files) => files.map((f) => f.file).filter((f) => !NOT_A_SOURCE_EDIT.has(path.basename(f))))
+      .filter((files) => files.length > 0);
+    if (!candidates.length) return null;
+    const files = candidates[Math.floor(Math.random() * candidates.length)];
+    return files[Math.floor(Math.random() * files.length)];
+  } catch {
+    return null;
+  }
+}
+
+/** Appends a newline per touch and puts the original bytes back on restore. */
+function installEdit(ws: Workspace, file: string): Edit | null {
+  const absolute = path.join(ws.root, file);
+  if (!fs.existsSync(absolute)) {
+    console.warn(`edit target ${file} does not exist; skipping semi-warm runs`);
+    return null;
+  }
+  const original = fs.readFileSync(absolute);
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    fs.writeFileSync(absolute, original);
+  };
+  process.on('exit', restore);
+  return {
+    file,
+    touch: () => fs.appendFileSync(absolute, '\n'),
+    restore,
+  };
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---------------------------------------------------------------------------
 // Instrumentation: swap nx's perf-logging module for the recording copy.
 
 interface Instrument {
@@ -404,7 +484,7 @@ function readTraces(ws: Workspace, runs: Run[]): ProcessTrace[] {
       const at = timeOrigin + m.startTime;
       if (at <= cold.endedAt) return { ...m, phase: 'cold', run: cold.index };
       const run = runs.reduce((current, r) => (r.startedAt <= at ? r : current), runs[1] ?? cold);
-      return { ...m, phase: 'warm', run: run.index };
+      return { ...m, phase: run.phase === 'cold' ? 'warm' : run.phase, run: run.index };
     });
     measures.sort((a, b) => a.startTime - b.startTime);
     traces.push({
@@ -444,17 +524,21 @@ const roleKind = (role: string) => role.split(':')[0];
  * process. Nested phases (a plugin's createNodes inside the daemon's graph
  * construction, say) are counted once, through the measure that contains them.
  */
-function topLevelMs(measures: MeasureRecord[]): number {
+function topLevel(measures: MeasureRecord[]): MeasureRecord[] {
   const ordered = [...measures].sort((a, b) => a.startTime - b.startTime || b.duration - a.duration);
   let outerEnd = -Infinity;
-  let sum = 0;
+  const outer: MeasureRecord[] = [];
   for (const m of ordered) {
     const end = m.startTime + m.duration;
     if (end <= outerEnd) continue;
     outerEnd = end;
-    sum += m.duration;
+    outer.push(m);
   }
-  return sum;
+  return outer;
+}
+
+function topLevelMs(measures: MeasureRecord[]): number {
+  return topLevel(measures).reduce((sum, m) => sum + m.duration, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +614,8 @@ interface Collected {
   coldGraphMs: number;
   warmMs: number[];
   warmMedianMs: number | null;
+  semiWarmMs: number[];
+  editedFile: string | null;
   reset: boolean;
   runs: Run[];
   records: string | null;
@@ -546,6 +632,9 @@ function renderMarkdown(r: Collected): string {
     `Projects: ${r.projectCount}`,
     `Cold ${md.code('nx show projects')} after ${md.code('nx reset')}: ${r.coldGraphMs} ms`,
     `Warm runs: ${r.warmMs.join(', ') || 'none'}${r.warmMs.length ? ` ms (median ${Math.round(median(r.warmMs))} ms)` : ''}`,
+    ...(r.editedFile
+      ? [`Semi-warm runs, after appending a line to ${md.code(r.editedFile)}: ${r.semiWarmMs.join(', ')} ms`]
+      : []),
     ...(r.reset ? [] : ['Daemon was not reset, so the cold run is only cold if no daemon was running.']),
   );
 
@@ -554,23 +643,26 @@ function renderMarkdown(r: Collected): string {
     sections.push('No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.');
   } else {
     const warmRuns = r.runs.filter((run) => run.phase === 'warm').length;
+    const semiWarmRuns = r.runs.filter((run) => run.phase === 'semi-warm').length;
+    const plural = (n: number) => (n === 1 ? '' : 's');
     sections.push(
       md.h2(
         'Processes',
-        renderProcesses(r.traces, warmRuns),
-        `Sums count nested measures once, through the outermost one. Warm is per run over ${warmRuns} warm run${warmRuns === 1 ? '' : 's'}. Every measure is in graph-perf.json.`,
+        renderProcesses(r.traces, warmRuns, semiWarmRuns),
+        `Sums count nested measures once, through the outermost one, and are per run: ${warmRuns} warm run${plural(warmRuns)}, ${semiWarmRuns} semi-warm run${plural(semiWarmRuns)} after a file edit. Every measure is in graph-perf.json.`,
       ),
     );
     sections.push(
       md.h2(
         'Key phases',
-        'A phase that stays slow warm costs every command, not just the first.',
+        'A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.',
         renderKeyPhases(r.workspaceRoot, r.traces),
       ),
     );
   }
 
   sections.push(md.h2('Plugin config files', ...renderPluginConfigFiles(r.pluginConfigFiles)));
+  if (r.traces.length) sections.push(md.h2('Timelines', ...renderTimelines(r)));
   sections.push(md.h2('nx report', ...renderReport(r.report, r.traces, r.records !== null)));
 
   const nxJsonKeys = ['plugins', 'targetDefaults'] as const;
@@ -589,13 +681,12 @@ function renderMarkdown(r: Collected): string {
   return md.h1('Nx graph construction', summary, ...sections) + '\n';
 }
 
-function renderProcesses(traces: ProcessTrace[], warmRuns: number): string {
+function renderProcesses(traces: ProcessTrace[], warmRuns: number, semiWarmRuns: number): string {
   const earliest = Math.min(...traces.map((t) => t.timeOrigin));
+  const perRun: Record<Phase, number> = { cold: 1, warm: warmRuns || 1, 'semi-warm': semiWarmRuns || 1 };
   const phaseSum = (t: ProcessTrace, phase: Phase) => {
     const subset = t.measures.filter((m) => m.phase === phase);
-    if (!subset.length) return '-';
-    const sum = topLevelMs(subset);
-    return ms(phase === 'warm' && warmRuns ? sum / warmRuns : sum);
+    return subset.length ? ms(topLevelMs(subset) / perRun[phase]) : '-';
   };
   return md.table(traces, [
     { label: 'pid', field: 'pid' },
@@ -603,11 +694,12 @@ function renderProcesses(traces: ProcessTrace[], warmRuns: number): string {
     { label: 'started at', mapFn: (t) => `+${ms(t.timeOrigin - earliest)}` },
     { label: 'cold', mapFn: (t) => phaseSum(t, 'cold') },
     { label: 'warm / run', mapFn: (t) => phaseSum(t, 'warm') },
+    { label: 'semi-warm / run', mapFn: (t) => phaseSum(t, 'semi-warm') },
   ]);
 }
 
 function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
-  type Row = { phase: string; process: string; cold: number[]; warm: number[] };
+  type Row = { phase: string; process: string; cold: number[]; warm: number[]; 'semi-warm': number[] };
   const byPhase = new Map<string, Row>();
   for (const t of traces) {
     for (const m of t.measures) {
@@ -615,12 +707,12 @@ function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
       if (!KEY_PHASES.some((p) => p.pattern.test(m.name) && (!p.role || p.role === kind))) continue;
       const phase = shortName(root, m.name).replace(/^plugin worker \d+ code loading$/, 'plugin worker code loading');
       const key = `${phase} ${roleKind(t.role)}`;
-      const entry = byPhase.get(key) ?? { phase, process: roleKind(t.role), cold: [], warm: [] };
+      const entry = byPhase.get(key) ?? { phase, process: kind, cold: [], warm: [], 'semi-warm': [] };
       entry[m.phase].push(m.duration);
       byPhase.set(key, entry);
     }
   }
-  const worst = (row: Row) => Math.max(...row.cold, ...row.warm);
+  const worst = (row: Row) => Math.max(...row.cold, ...row.warm, ...row['semi-warm']);
   const rows = [...byPhase.values()].sort((a, b) => worst(b) - worst(a));
   const stat = (values: number[], pick: (v: number[]) => number) => (values.length ? ms(pick(values)) : '-');
   return md.table(rows, [
@@ -629,7 +721,49 @@ function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
     { label: 'cold', mapFn: (p) => stat(p.cold, (v) => Math.max(...v)) },
     { label: 'warm median', mapFn: (p) => stat(p.warm, median) },
     { label: 'warm max', mapFn: (p) => stat(p.warm, (v) => Math.max(...v)) },
+    { label: 'semi-warm median', mapFn: (p) => stat(p['semi-warm'], median) },
   ]);
+}
+
+const isKeyPhase = (name: string, kind: string) =>
+  KEY_PHASES.some((p) => p.pattern.test(name) && (!p.role || p.role === kind));
+
+/** Mermaid text is split on colons and semicolons; keep labels to safe characters. */
+const mermaidLabel = (text: string) => text.replace(/[:;#]/g, '-');
+
+/**
+ * One Gantt chart per phase: every process that did work in that phase is a
+ * section, and its top-level measures plus the key phases are the bars.
+ * Times count from the phase's first run window.
+ */
+function renderTimelines(r: Collected): string[] {
+  const parts: string[] = [
+    'Bars are top-level measures and key phases; time counts from the start of the first run of that kind.',
+  ];
+  for (const phase of ['cold', 'warm', 'semi-warm'] as Phase[]) {
+    const windows = r.runs.filter((run) => run.phase === phase);
+    if (!windows.length) continue;
+    const t0 = windows[0].startedAt;
+    const lines = ['gantt', `  title ${phase}`, '  dateFormat x', '  axisFormat %S.%Ls', '  todayMarker off'];
+    let bars = 0;
+    for (const t of r.traces) {
+      const kind = roleKind(t.role);
+      const inPhase = t.measures.filter((m) => m.phase === phase);
+      if (!inPhase.length) continue;
+      const outer = new Set(topLevel(inPhase));
+      const shown = inPhase.filter((m) => outer.has(m) || isKeyPhase(m.name, kind));
+      if (!shown.length) continue;
+      lines.push(`  section ${mermaidLabel(t.role)} ${t.pid}`);
+      for (const m of shown) {
+        const start = Math.round(t.timeOrigin + m.startTime - t0);
+        const end = start + Math.max(1, Math.round(m.duration));
+        lines.push(`  ${mermaidLabel(shortName(r.workspaceRoot, m.name))} :${start}, ${end}`);
+        bars++;
+      }
+    }
+    if (bars) parts.push(md.h3(phase, md.codeBlock(lines.join('\n'), 'mermaid')));
+  }
+  return parts;
 }
 
 function renderPluginConfigFiles(plugins: PluginConfigFiles[] | Failure): string[] {
@@ -727,6 +861,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
   }
 
   let instrument: Instrument | null = null;
+  let edit: Edit | null = null;
   if (opts.instrument) {
     const source = opts.instrumentFile
       ? fs.readFileSync(path.resolve(opts.instrumentFile), 'utf8')
@@ -763,6 +898,33 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
     }
     const warmMs = runs.filter((run) => run.phase === 'warm').map((run) => run.wallMs);
 
+    // An edited file makes the daemon rehash and rebuild what depends on it.
+    // The run's window opens at the edit so that work is tagged semi-warm
+    // whether the daemon does it before or during the request.
+    if (opts.edits > 0) {
+      const target = opts.editFile ?? pickEditTarget(ws);
+      if (!target) console.warn('no project file to edit; skipping semi-warm runs');
+      else edit = installEdit(ws, target);
+    }
+    if (edit) {
+      for (let i = 1; i <= opts.edits; i++) {
+        console.log(`semi-warm run ${i} of ${opts.edits}: editing ${edit.file}`);
+        const editedAt = Date.now();
+        edit.touch();
+        await sleep(500);
+        const semiWarm = nx(ws, ['show', 'projects', '--json']);
+        assertOk('nx show projects (semi-warm)', semiWarm);
+        runs.push({
+          index: runs.length,
+          phase: 'semi-warm',
+          startedAt: editedAt,
+          endedAt: semiWarm.endedAt,
+          wallMs: semiWarm.wallMs,
+        });
+      }
+    }
+    const semiWarmMs = runs.filter((run) => run.phase === 'semi-warm').map((run) => run.wallMs);
+
     // Stop recording before anything that is not graph construction runs.
     withdrawSession(ws);
     const traces = instrument ? readTraces(ws, runs) : [];
@@ -788,6 +950,8 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
       coldGraphMs: Math.round(cold.wallMs),
       warmMs: warmMs.map(Math.round),
       warmMedianMs: warmMs.length ? Math.round(median(warmMs)) : null,
+      semiWarmMs: semiWarmMs.map(Math.round),
+      editedFile: edit?.file ?? null,
       reset: opts.reset,
       runs,
       records: instrument ? path.relative(ws.root, ws.sessionDir) : null,
@@ -802,9 +966,10 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
 
     console.log(`wrote ${path.join(outDir, 'graph-perf.md')} and graph-perf.json`);
     console.log(
-      `projects ${projects.length}, cold ${result.coldGraphMs}ms, warm median ${result.warmMedianMs ?? 'n/a'}ms, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`,
+      `projects ${projects.length}, cold ${result.coldGraphMs}ms, warm median ${result.warmMedianMs ?? 'n/a'}ms, semi-warm ${semiWarmMs.length ? `${semiWarmMs.map(Math.round).join('/')}ms` : 'n/a'}, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`,
     );
   } finally {
+    edit?.restore();
     withdrawSession(ws);
     instrument?.restore();
   }
