@@ -579,20 +579,44 @@ function shortName(root, name) {
 	return short.replace(/node_modules[\\/]\.pnpm[\\/][^\\/]+[\\/]node_modules[\\/]/g, "node_modules/").replace(/(^|[\s:])(?:(?:[A-Za-z]:)?[^\s:]*[\\/])?node_modules[\\/]/, "$1node_modules/").replace(/node_modules[\\/]nx[\\/]dist[\\/]src[\\/]plugins[\\/]/g, "nx:").replace(/node_modules[\\/]/g, "");
 }
 const KEY_PHASES = [
-	/^total for creating and serializing project graph$/,
-	/^total execution time for createProjectGraph\(\)$/,
-	/^build-project-configs$/,
-	/:createNodes$/,
-	/^createNodes:merge$/,
-	/^createDependencies$/,
-	/:createDependencies$/,
-	/^Load Nx Plugin: /,
-	/^loadSpecifiedNxPlugins$/,
-	/^loadDefaultNxPlugins$/,
-	/^plugin worker \d+ code loading$/,
-	/^start-plugin-worker:/,
-	/^createProjectGraphAsync$/,
-	/^REQUEST_PROJECT_GRAPH round trip$/
+	{
+		pattern: /^total for creating and serializing project graph$/,
+		role: "daemon"
+	},
+	{
+		pattern: /^total execution time for createProjectGraph\(\)$/,
+		role: "daemon"
+	},
+	{
+		pattern: /^build-project-configs$/,
+		role: "daemon"
+	},
+	{ pattern: /:createNodes$/ },
+	{
+		pattern: /^createNodes:merge$/,
+		role: "daemon"
+	},
+	{
+		pattern: /^createDependencies$/,
+		role: "daemon"
+	},
+	{ pattern: /:createDependencies$/ },
+	{ pattern: /^Load Nx Plugin: / },
+	{ pattern: /^loadSpecifiedNxPlugins$/ },
+	{ pattern: /^loadDefaultNxPlugins$/ },
+	{
+		pattern: /^plugin worker \d+ code loading$/,
+		role: "plugin worker"
+	},
+	{ pattern: /^start-plugin-worker:/ },
+	{
+		pattern: /^createProjectGraphAsync$/,
+		role: "client"
+	},
+	{
+		pattern: /^REQUEST_PROJECT_GRAPH round trip$/,
+		role: "client"
+	}
 ];
 function renderMarkdown(r) {
 	const sys = r.system;
@@ -643,7 +667,8 @@ function renderProcesses(traces, warmRuns) {
 function renderKeyPhases(root, traces) {
 	const byPhase = /* @__PURE__ */ new Map();
 	for (const t of traces) for (const m of t.measures) {
-		if (!KEY_PHASES.some((p) => p.test(m.name))) continue;
+		const kind = roleKind(t.role);
+		if (!KEY_PHASES.some((p) => p.pattern.test(m.name) && (!p.role || p.role === kind))) continue;
 		const phase = shortName(root, m.name).replace(/^plugin worker \d+ code loading$/, "plugin worker code loading");
 		const key = `${phase} ${roleKind(t.role)}`;
 		const entry = byPhase.get(key) ?? {

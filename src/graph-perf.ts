@@ -502,21 +502,24 @@ function shortName(root: string, name: string): string {
   );
 }
 
-const KEY_PHASES = [
-  /^total for creating and serializing project graph$/,
-  /^total execution time for createProjectGraph\(\)$/,
-  /^build-project-configs$/,
-  /:createNodes$/,
-  /^createNodes:merge$/,
-  /^createDependencies$/,
-  /:createDependencies$/,
-  /^Load Nx Plugin: /,
-  /^loadSpecifiedNxPlugins$/,
-  /^loadDefaultNxPlugins$/,
-  /^plugin worker \d+ code loading$/,
-  /^start-plugin-worker:/,
-  /^createProjectGraphAsync$/,
-  /^REQUEST_PROJECT_GRAPH round trip$/,
+// Phases worth a row, each limited to the process kind where the name means
+// what it says: `createProjectGraphAsync` inside the daemon is a sync
+// generator reading the in-memory graph, not a graph construction.
+const KEY_PHASES: { pattern: RegExp; role?: string }[] = [
+  { pattern: /^total for creating and serializing project graph$/, role: 'daemon' },
+  { pattern: /^total execution time for createProjectGraph\(\)$/, role: 'daemon' },
+  { pattern: /^build-project-configs$/, role: 'daemon' },
+  { pattern: /:createNodes$/ },
+  { pattern: /^createNodes:merge$/, role: 'daemon' },
+  { pattern: /^createDependencies$/, role: 'daemon' },
+  { pattern: /:createDependencies$/ },
+  { pattern: /^Load Nx Plugin: / },
+  { pattern: /^loadSpecifiedNxPlugins$/ },
+  { pattern: /^loadDefaultNxPlugins$/ },
+  { pattern: /^plugin worker \d+ code loading$/, role: 'plugin worker' },
+  { pattern: /^start-plugin-worker:/ },
+  { pattern: /^createProjectGraphAsync$/, role: 'client' },
+  { pattern: /^REQUEST_PROJECT_GRAPH round trip$/, role: 'client' },
 ];
 
 interface Collected {
@@ -608,7 +611,8 @@ function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
   const byPhase = new Map<string, Row>();
   for (const t of traces) {
     for (const m of t.measures) {
-      if (!KEY_PHASES.some((p) => p.test(m.name))) continue;
+      const kind = roleKind(t.role);
+      if (!KEY_PHASES.some((p) => p.pattern.test(m.name) && (!p.role || p.role === kind))) continue;
       const phase = shortName(root, m.name).replace(/^plugin worker \d+ code loading$/, 'plugin worker code loading');
       const key = `${phase} ${roleKind(t.role)}`;
       const entry = byPhase.get(key) ?? { phase, process: roleKind(t.role), cold: [], warm: [] };
