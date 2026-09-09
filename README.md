@@ -42,10 +42,10 @@ If you would rather read the code before running it, clone the repo and run the 
 git clone https://github.com/AgentEnder/nx-graph-perf.git
 cd nx-graph-perf
 npm install
-npm run collect -- /path/to/your/workspace
+npx nx run nx-graph-perf /path/to/your/workspace
 ```
 
-Any further arguments are passed through, for example `npm run collect -- ../my-workspace --runs 5`.
+The clone is itself an Nx workspace with one project, and `run` is one of its targets. Any further arguments are passed through, for example `npx nx run nx-graph-perf ../my-workspace --runs 5`. `npm run run -- ../my-workspace` is the same thing without Nx in the middle.
 
 The report lands in `reports/<workspace name>/` inside the clone, so the workspace itself is left as it was apart from the daemon reset. Pass `--out` to put it elsewhere.
 
@@ -88,10 +88,10 @@ The raw measures stay in `.nx/workspace-data/perf-logs/` until the next `nx rese
 
 ```sh
 npm install
-npm run check   # typecheck with tsc
-npm run build   # bundle src/ into dist/graph-perf.js with rolldown
+npx nx typecheck   # tsc over src/, scripts/ and the rolldown config
+npx nx build       # bundle src/ into dist/graph-perf.js with rolldown
 ```
 
-`dist/graph-perf.js` is committed so the curl commands above work without a build step. Rebuild and commit it with any change to `src/`.
+Both targets are cached. `dist/graph-perf.js` is committed so the curl commands above work without a build step, and it is listed in `.nxignore` so the committed bundle does not count as an input. Rebuild and commit it with any change to `src/`.
 
-`npm run fixture -- <dir> [projects] [nxVersion]` generates a throwaway workspace for trying the script, and `npm run collect -- <dir>` runs the source against it.
+`npx nx run nx-graph-perf:fixture <dir> [projects] [nxVersion]` generates a throwaway workspace for trying the script, and `npx nx run nx-graph-perf <dir>` runs the source against it.

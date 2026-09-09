@@ -7,16 +7,17 @@
   "repository": "github:AgentEnder/nx-graph-perf",
   "scripts": {
     "build": "rolldown -c",
-    "check": "tsc -p tsconfig.json",
-    "collect": "jiti scripts/run.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "run": "jiti scripts/run.ts",
     "fixture": "node scripts/make-fixture.js"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "jiti": "^2.7.0",
     "markdown-factory": "^1.0.0",
-    "nx": "latest",
+    "nx": "23.2.0",
     "rolldown": "^1.2.8",
     "typescript": "^5.6.0"
-  }
+  },
+  "nx": {}
 }
