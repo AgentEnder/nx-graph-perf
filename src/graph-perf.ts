@@ -77,15 +77,16 @@ type Run = {
   startedAt: number;
   endedAt: number;
   wallMs: number;
-  /** Semi-warm runs: the file edited first, and the plugin whose glob matches it. */
-  file?: string;
-  plugin?: string | null;
+  /** Semi-warm runs: the files edited together right before the request. */
+  edits?: EditPlan[];
 };
 
-interface EditPlan {
+type EditPlan = {
   file: string;
-  plugin: string | null;
-}
+  project: string;
+  /** Every plugin whose glob matches the file; empty for a plain source file. */
+  plugins: string[];
+};
 
 interface Edit extends EditPlan {
   touch(): void;
@@ -440,30 +441,53 @@ function readProjectOfFile(ws: Workspace): Map<string, string> {
 }
 
 /**
- * One edit per plugin that matched config files, then `sourceEdits` edits of
- * ordinary source files. Each edit lands in a project no earlier edit used,
- * as long as there are enough projects, so the runs exercise different parts
- * of the graph rather than one hot spot.
+ * One file per plugin that matched config files, chosen so the edits touch
+ * as few projects as possible: projects are taken greedily by how many still
+ * uncovered plugins they can serve, with ties and files picked at random.
+ * Then `sourceEdits` ordinary source files, from projects already in the plan
+ * where possible. All edits are applied together before each semi-warm run.
  */
 function planEdits(ws: Workspace, matched: Map<string, string[]>, sourceEdits: number): EditPlan[] {
   const owner = readProjectOfFile(ws);
   const projectOf = (file: string) => owner.get(file) ?? file;
-  const usedProjects = new Set<string>();
-  const usedFiles = new Set<string>();
+  // project -> plugin -> editable files of that plugin inside the project
+  const byProject = new Map<string, Map<string, string[]>>();
+  for (const [plugin, files] of matched) {
+    for (const file of files) {
+      if (neverEdit(file)) continue;
+      const project = projectOf(file);
+      const plugins = byProject.get(project) ?? new Map<string, string[]>();
+      plugins.set(plugin, [...(plugins.get(plugin) ?? []), file]);
+      byProject.set(project, plugins);
+    }
+  }
+  const uncovered = new Set([...byProject.values()].flatMap((plugins) => [...plugins.keys()]));
   const plan: EditPlan[] = [];
-  const take = (files: string[], plugin: string | null) => {
-    const fresh = files.filter((f) => !usedFiles.has(f) && !neverEdit(f));
-    if (!fresh.length) return;
-    const unusedProject = fresh.filter((f) => !usedProjects.has(projectOf(f)));
-    const file = pick(unusedProject.length ? unusedProject : fresh);
-    usedFiles.add(file);
-    usedProjects.add(projectOf(file));
-    plan.push({ file, plugin });
-  };
-  for (const [plugin, files] of matched) take(files, plugin);
+  const usedProjects = new Set<string>();
+  while (uncovered.size) {
+    const gain = (project: string) => [...byProject.get(project)!.keys()].filter((p) => uncovered.has(p)).length;
+    const best = Math.max(...[...byProject.keys()].map(gain));
+    const project = pick([...byProject.keys()].filter((p) => gain(p) === best));
+    for (const [plugin, files] of byProject.get(project)!) {
+      if (!uncovered.has(plugin)) continue;
+      uncovered.delete(plugin);
+      // A file already in the batch serves every plugin that matches it.
+      const existing = plan.find((e) => files.includes(e.file));
+      if (existing) existing.plugins.push(plugin);
+      else plan.push({ file: pick(files), project, plugins: [plugin] });
+    }
+    usedProjects.add(project);
+  }
   const configFiles = new Set([...matched.values()].flat());
-  const sourceFiles = [...owner.keys()].filter((f) => !configFiles.has(f) && !neverEdit(f));
-  for (let i = 0; i < sourceEdits; i++) take(sourceFiles, null);
+  const planned = new Set(plan.map((e) => e.file));
+  const sources = [...owner.keys()].filter((f) => !configFiles.has(f) && !neverEdit(f) && !planned.has(f));
+  for (let i = 0; i < sourceEdits && sources.length; i++) {
+    const inUsed = sources.filter((f) => usedProjects.has(projectOf(f)));
+    const file = pick(inUsed.length ? inUsed : sources);
+    sources.splice(sources.indexOf(file), 1);
+    usedProjects.add(projectOf(file));
+    plan.push({ file, project: projectOf(file), plugins: [] });
+  }
   return plan;
 }
 
@@ -781,7 +805,7 @@ function renderMarkdown(r: Collected): string {
   const summary = md.ul(
     `Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`,
     `Projects: ${r.projectCount}`,
-    `Cycles: ${r.cycles}, each ${r.reset ? `${md.code('nx reset')}, ` : ''}cold ${md.code('nx show projects')}, warm, then ${r.edits.length} semi-warm edit${r.edits.length === 1 ? '' : 's'}`,
+    `Cycles: ${r.cycles}, each ${r.reset ? `${md.code('nx reset')}, ` : ''}cold ${md.code('nx show projects')}, warm, then semi-warm after ${r.edits.length} file edit${r.edits.length === 1 ? '' : 's'} in ${new Set(r.edits.map((e) => e.project)).size} project${new Set(r.edits.map((e) => e.project)).size === 1 ? '' : 's'}`,
     `Cold: ${series(r.coldMs)}`,
     `Warm: ${series(r.warmMs)}`,
     ...(r.edits.length ? [`Semi-warm: ${series(r.semiWarmMs)}`] : []),
@@ -802,9 +826,9 @@ function renderMarkdown(r: Collected): string {
     if (r.edits.length) {
       sections.push(
         md.h2(
-          'Semi-warm runs',
-          'One edit per plugin whose glob matched a file, then source-file edits, repeated every cycle. Daemon is the sum of its top-level measures inside that run.',
-          renderSemiWarmRuns(r),
+          'Semi-warm edits',
+          'Applied together, a newline each, right before every semi-warm run: one file per plugin whose glob matched anything, in as few projects as possible, then plain source files.',
+          renderSemiWarmEdits(r),
         ),
       );
     }
@@ -837,29 +861,12 @@ function renderMarkdown(r: Collected): string {
   return md.h1('Nx graph construction', summary, ...sections) + '\n';
 }
 
-function renderSemiWarmRuns(r: Collected): string {
-  const daemons = r.traces.filter((t) => t.role === 'daemon');
-  const daemonMs = (run: Run) => topLevelMs(daemons.flatMap((t) => t.measures.filter((m) => m.run === run.index)));
-  type Row = { file: string; plugin: string | null; client: number[]; daemon: number[] };
-  const byEdit = new Map<string, Row>();
-  for (const run of r.runs) {
-    if (run.phase !== 'semi-warm' || !run.file) continue;
-    const row = byEdit.get(run.file) ?? { file: run.file, plugin: run.plugin ?? null, client: [], daemon: [] };
-    row.client.push(run.wallMs);
-    if (daemons.length) row.daemon.push(daemonMs(run));
-    byEdit.set(run.file, row);
-  }
-  const stat = (values: number[]) => (values.length ? ms(median(values)) : '-');
-  return md.table(
-    [...byEdit.values()],
-    [
-      { label: 'edited file', mapFn: (row) => md.code(row.file) },
-      { label: 'matched by', mapFn: (row) => (row.plugin ? cell(row.plugin) : 'no plugin (source file)') },
-      { label: 'runs', mapFn: (row) => row.client.length },
-      { label: 'client median', mapFn: (row) => stat(row.client) },
-      { label: 'daemon median', mapFn: (row) => stat(row.daemon) },
-    ],
-  );
+function renderSemiWarmEdits(r: Collected): string {
+  return md.table(r.edits, [
+    { label: 'edited file', mapFn: (e) => md.code(e.file) },
+    { label: 'project', mapFn: (e) => cell(e.project) },
+    { label: 'matched by', mapFn: (e) => (e.plugins.length ? cell(e.plugins.join(', ')) : 'no plugin (source file)') },
+  ]);
 }
 
 function renderProcesses(traces: ProcessTrace[], runs: Run[]): string {
@@ -1125,7 +1132,13 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
         if (instrument) announceSession(ws);
         if (opts.edit) {
           const plan = opts.editFile
-            ? [{ file: opts.editFile, plugin: null }]
+            ? [
+                {
+                  file: opts.editFile,
+                  project: readProjectOfFile(ws).get(opts.editFile) ?? opts.editFile,
+                  plugins: [],
+                },
+              ]
             : planEdits(ws, 'error' in inspection ? new Map() : inspection.matched, opts.sourceEdits);
           if (!plan.length) console.warn('nothing to edit; skipping semi-warm runs');
           for (const item of plan) {
@@ -1135,18 +1148,21 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
         }
       }
 
-      // An edited file makes the daemon rehash and rebuild what depends on it.
-      // Each run's window opens at its edit so that work is tagged semi-warm
-      // whether the daemon does it before or during the request.
-      for (const [i, edit] of edits.entries()) {
-        console.log(
-          `${tag}: semi-warm ${i + 1} of ${edits.length}, editing ${edit.file}${edit.plugin ? ` (${edit.plugin})` : ''}`,
-        );
+      // The edits make the daemon rehash and rebuild what depends on them,
+      // all in one go. The run's window opens at the first edit so that work
+      // is tagged semi-warm whether the daemon does it before or during the
+      // request.
+      if (edits.length) {
+        console.log(`${tag}: semi-warm, editing ${edits.length} file${edits.length === 1 ? '' : 's'}`);
         const editedAt = Date.now();
-        edit.touch();
+        for (const edit of edits) edit.touch();
         await sleep(500);
         const semiWarm = show('semi-warm');
-        record('semi-warm', { ...semiWarm, startedAt: editedAt }, { file: edit.file, plugin: edit.plugin });
+        record(
+          'semi-warm',
+          { ...semiWarm, startedAt: editedAt },
+          { edits: edits.map(({ file, project, plugins }) => ({ file, project, plugins })) },
+        );
       }
 
       withdrawSession(ws);
@@ -1178,7 +1194,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
       coldMs: byPhase('cold'),
       warmMs: byPhase('warm'),
       semiWarmMs: byPhase('semi-warm'),
-      edits: edits.map(({ file, plugin }) => ({ file, plugin })),
+      edits: edits.map(({ file, project, plugins }) => ({ file, project, plugins })),
       reset: opts.reset,
       runs,
       instrumented: instrument !== null,

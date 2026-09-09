@@ -493,33 +493,57 @@ function readProjectOfFile(ws) {
 	return owner;
 }
 /**
-* One edit per plugin that matched config files, then `sourceEdits` edits of
-* ordinary source files. Each edit lands in a project no earlier edit used,
-* as long as there are enough projects, so the runs exercise different parts
-* of the graph rather than one hot spot.
+* One file per plugin that matched config files, chosen so the edits touch
+* as few projects as possible: projects are taken greedily by how many still
+* uncovered plugins they can serve, with ties and files picked at random.
+* Then `sourceEdits` ordinary source files, from projects already in the plan
+* where possible. All edits are applied together before each semi-warm run.
 */
 function planEdits(ws, matched, sourceEdits) {
 	const owner = readProjectOfFile(ws);
 	const projectOf = (file) => owner.get(file) ?? file;
-	const usedProjects = /* @__PURE__ */ new Set();
-	const usedFiles = /* @__PURE__ */ new Set();
+	const byProject = /* @__PURE__ */ new Map();
+	for (const [plugin, files] of matched) for (const file of files) {
+		if (neverEdit(file)) continue;
+		const project = projectOf(file);
+		const plugins = byProject.get(project) ?? /* @__PURE__ */ new Map();
+		plugins.set(plugin, [...plugins.get(plugin) ?? [], file]);
+		byProject.set(project, plugins);
+	}
+	const uncovered = new Set([...byProject.values()].flatMap((plugins) => [...plugins.keys()]));
 	const plan = [];
-	const take = (files, plugin) => {
-		const fresh = files.filter((f) => !usedFiles.has(f) && !neverEdit(f));
-		if (!fresh.length) return;
-		const unusedProject = fresh.filter((f) => !usedProjects.has(projectOf(f)));
-		const file = pick(unusedProject.length ? unusedProject : fresh);
-		usedFiles.add(file);
+	const usedProjects = /* @__PURE__ */ new Set();
+	while (uncovered.size) {
+		const gain = (project) => [...byProject.get(project).keys()].filter((p) => uncovered.has(p)).length;
+		const best = Math.max(...[...byProject.keys()].map(gain));
+		const project = pick([...byProject.keys()].filter((p) => gain(p) === best));
+		for (const [plugin, files] of byProject.get(project)) {
+			if (!uncovered.has(plugin)) continue;
+			uncovered.delete(plugin);
+			const existing = plan.find((e) => files.includes(e.file));
+			if (existing) existing.plugins.push(plugin);
+			else plan.push({
+				file: pick(files),
+				project,
+				plugins: [plugin]
+			});
+		}
+		usedProjects.add(project);
+	}
+	const configFiles = new Set([...matched.values()].flat());
+	const planned = new Set(plan.map((e) => e.file));
+	const sources = [...owner.keys()].filter((f) => !configFiles.has(f) && !neverEdit(f) && !planned.has(f));
+	for (let i = 0; i < sourceEdits && sources.length; i++) {
+		const inUsed = sources.filter((f) => usedProjects.has(projectOf(f)));
+		const file = pick(inUsed.length ? inUsed : sources);
+		sources.splice(sources.indexOf(file), 1);
 		usedProjects.add(projectOf(file));
 		plan.push({
 			file,
-			plugin
+			project: projectOf(file),
+			plugins: []
 		});
-	};
-	for (const [plugin, files] of matched) take(files, plugin);
-	const configFiles = new Set([...matched.values()].flat());
-	const sourceFiles = [...owner.keys()].filter((f) => !configFiles.has(f) && !neverEdit(f));
-	for (let i = 0; i < sourceEdits; i++) take(sourceFiles, null);
+	}
 	return plan;
 }
 /** Appends a newline per touch and puts the original bytes back on restore. */
@@ -772,12 +796,12 @@ const series = (values) => values.length ? `${values.join(", ")} ms${values.leng
 const countBy = (runs, phase) => runs.filter((run) => run.phase === phase).length;
 function renderMarkdown(r) {
 	const sys = r.system;
-	const summary = ul(`Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`, `Projects: ${r.projectCount}`, `Cycles: ${r.cycles}, each ${r.reset ? `${code("nx reset")}, ` : ""}cold ${code("nx show projects")}, warm, then ${r.edits.length} semi-warm edit${r.edits.length === 1 ? "" : "s"}`, `Cold: ${series(r.coldMs)}`, `Warm: ${series(r.warmMs)}`, ...r.edits.length ? [`Semi-warm: ${series(r.semiWarmMs)}`] : [], ...r.reset ? [] : ["Daemon was not reset, so a cold run is only cold if no daemon was running."]);
+	const summary = ul(`Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`, `Projects: ${r.projectCount}`, `Cycles: ${r.cycles}, each ${r.reset ? `${code("nx reset")}, ` : ""}cold ${code("nx show projects")}, warm, then semi-warm after ${r.edits.length} file edit${r.edits.length === 1 ? "" : "s"} in ${new Set(r.edits.map((e) => e.project)).size} project${new Set(r.edits.map((e) => e.project)).size === 1 ? "" : "s"}`, `Cold: ${series(r.coldMs)}`, `Warm: ${series(r.warmMs)}`, ...r.edits.length ? [`Semi-warm: ${series(r.semiWarmMs)}`] : [], ...r.reset ? [] : ["Daemon was not reset, so a cold run is only cold if no daemon was running."]);
 	const sections = [];
 	if (r.traces.length === 0) sections.push("No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.");
 	else {
 		sections.push(h2("Processes", renderProcesses(r.traces, r.runs), `One row per kind of process, across every cycle. Sums count nested measures once, through the outermost one, and are per run of that phase (${countBy(r.runs, "cold")} cold, ${countBy(r.runs, "warm")} warm, ${countBy(r.runs, "semi-warm")} semi-warm). Workers of a plugin registered more than once are told apart by their nx.json position, matched through spawn order. Every measure is in graph-perf.json.`));
-		if (r.edits.length) sections.push(h2("Semi-warm runs", "One edit per plugin whose glob matched a file, then source-file edits, repeated every cycle. Daemon is the sum of its top-level measures inside that run.", renderSemiWarmRuns(r)));
+		if (r.edits.length) sections.push(h2("Semi-warm edits", "Applied together, a newline each, right before every semi-warm run: one file per plugin whose glob matched anything, in as few projects as possible, then plain source files.", renderSemiWarmEdits(r)));
 		sections.push(h2("Key phases", "A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.", renderKeyPhases(r.workspaceRoot, r.traces)));
 	}
 	sections.push(h2("Plugin config files", ...renderPluginConfigFiles(r.pluginConfigFiles)));
@@ -786,43 +810,19 @@ function renderMarkdown(r) {
 	sections.push(h2("nx.json", ...["plugins", "targetDefaults"].map((key) => h3(key, codeBlock(JSON.stringify("error" in r.nxJson ? r.nxJson.error : r.nxJson[key] ?? null, null, 2), "json")))));
 	return h1("Nx graph construction", summary, ...sections) + "\n";
 }
-function renderSemiWarmRuns(r) {
-	const daemons = r.traces.filter((t) => t.role === "daemon");
-	const daemonMs = (run) => topLevelMs(daemons.flatMap((t) => t.measures.filter((m) => m.run === run.index)));
-	const byEdit = /* @__PURE__ */ new Map();
-	for (const run of r.runs) {
-		if (run.phase !== "semi-warm" || !run.file) continue;
-		const row = byEdit.get(run.file) ?? {
-			file: run.file,
-			plugin: run.plugin ?? null,
-			client: [],
-			daemon: []
-		};
-		row.client.push(run.wallMs);
-		if (daemons.length) row.daemon.push(daemonMs(run));
-		byEdit.set(run.file, row);
-	}
-	const stat = (values) => values.length ? ms(median(values)) : "-";
-	return table([...byEdit.values()], [
+function renderSemiWarmEdits(r) {
+	return table(r.edits, [
 		{
 			label: "edited file",
-			mapFn: (row) => code(row.file)
+			mapFn: (e) => code(e.file)
+		},
+		{
+			label: "project",
+			mapFn: (e) => cell(e.project)
 		},
 		{
 			label: "matched by",
-			mapFn: (row) => row.plugin ? cell(row.plugin) : "no plugin (source file)"
-		},
-		{
-			label: "runs",
-			mapFn: (row) => row.client.length
-		},
-		{
-			label: "client median",
-			mapFn: (row) => stat(row.client)
-		},
-		{
-			label: "daemon median",
-			mapFn: (row) => stat(row.daemon)
+			mapFn: (e) => e.plugins.length ? cell(e.plugins.join(", ")) : "no plugin (source file)"
 		}
 	]);
 }
@@ -1077,7 +1077,8 @@ async function run(argv, workspaceRoot) {
 				if (opts.edit) {
 					const plan = opts.editFile ? [{
 						file: opts.editFile,
-						plugin: null
+						project: readProjectOfFile(ws).get(opts.editFile) ?? opts.editFile,
+						plugins: []
 					}] : planEdits(ws, "error" in inspection ? /* @__PURE__ */ new Map() : inspection.matched, opts.sourceEdits);
 					if (!plan.length) console.warn("nothing to edit; skipping semi-warm runs");
 					for (const item of plan) {
@@ -1086,18 +1087,19 @@ async function run(argv, workspaceRoot) {
 					}
 				}
 			}
-			for (const [i, edit] of edits.entries()) {
-				console.log(`${tag}: semi-warm ${i + 1} of ${edits.length}, editing ${edit.file}${edit.plugin ? ` (${edit.plugin})` : ""}`);
+			if (edits.length) {
+				console.log(`${tag}: semi-warm, editing ${edits.length} file${edits.length === 1 ? "" : "s"}`);
 				const editedAt = Date.now();
-				edit.touch();
+				for (const edit of edits) edit.touch();
 				await sleep(500);
 				record("semi-warm", {
 					...show("semi-warm"),
 					startedAt: editedAt
-				}, {
-					file: edit.file,
-					plugin: edit.plugin
-				});
+				}, { edits: edits.map(({ file, project, plugins }) => ({
+					file,
+					project,
+					plugins
+				})) });
 			}
 			withdrawSession(ws);
 		}
@@ -1129,9 +1131,10 @@ async function run(argv, workspaceRoot) {
 			coldMs: byPhase("cold"),
 			warmMs: byPhase("warm"),
 			semiWarmMs: byPhase("semi-warm"),
-			edits: edits.map(({ file, plugin }) => ({
+			edits: edits.map(({ file, project, plugins }) => ({
 				file,
-				plugin
+				project,
+				plugins
 			})),
 			reset: opts.reset,
 			runs,
