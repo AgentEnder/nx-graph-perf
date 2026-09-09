@@ -486,7 +486,7 @@ function shortName(root: string, name: string): string {
       .replace(/node_modules[\\/]\.pnpm[\\/][^\\/]+[\\/]node_modules[\\/]/g, 'node_modules/')
       // a package resolved from above the workspace keeps its absolute prefix;
       // the path token runs from the start or a label separator to node_modules
-      .replace(/(^|[\s:])(?:\S*[\\/])?node_modules[\\/]/, '$1node_modules/')
+      .replace(/(^|[\s:])(?:(?:[A-Za-z]:)?[^\s:]*[\\/])?node_modules[\\/]/, '$1node_modules/')
       .replace(/node_modules[\\/]nx[\\/]dist[\\/]src[\\/]plugins[\\/]/g, 'nx:')
       .replace(/node_modules[\\/]/g, '')
   );
@@ -530,8 +530,8 @@ function renderMarkdown(r: Collected): string {
   const summary = md.ul(
     `Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`,
     `Projects: ${r.projectCount}`,
-    `Cold graph (first ${md.code('nx show projects')} after ${md.code('nx reset')}, daemon start included): ${r.coldGraphMs} ms`,
-    `Warm client round trips: ${r.warmMs.join(', ') || 'none'}${r.warmMs.length ? ` (median ${Math.round(median(r.warmMs))} ms)` : ''}`,
+    `Cold ${md.code('nx show projects')} after ${md.code('nx reset')}: ${r.coldGraphMs} ms`,
+    `Warm runs: ${r.warmMs.join(', ') || 'none'}${r.warmMs.length ? ` ms (median ${Math.round(median(r.warmMs))} ms)` : ''}`,
   );
 
   const sections: string[] = [];
@@ -543,31 +543,14 @@ function renderMarkdown(r: Collected): string {
       md.h2(
         'Processes',
         renderProcesses(r.traces, warmRuns),
-        `Sums add up the measures of a process that are not fully inside another of its measures, so nested phases count once; for a plugin worker that is roughly what the plugin cost. A measure is cold or warm by which timed command was in flight when it started. Warm is per run, over ${warmRuns} warm run${warmRuns === 1 ? '' : 's'}.`,
+        `Sums count nested measures once, through the outermost one. Warm is per run over ${warmRuns} warm run${warmRuns === 1 ? '' : 's'}. Every measure is in graph-perf.json.`,
       ),
     );
     sections.push(
       md.h2(
         'Key phases',
-        'Cold is the occurrence during the first graph construction; warm covers every later run. A phase that is slow warm costs every command, not just the first.',
+        'A phase that stays slow warm costs every command, not just the first.',
         renderKeyPhases(r.workspaceRoot, r.traces),
-      ),
-    );
-    sections.push(
-      md.h2(
-        'Timelines',
-        'Offsets are from each process start. Every recorded measure, in start order.',
-        ...r.traces.map((t) =>
-          md.h3(
-            `${t.role}, pid ${t.pid}`,
-            md.table(t.measures, [
-              { label: 'start', mapFn: (m) => `+${ms(m.startTime)}` },
-              { label: 'duration', mapFn: (m) => ms(m.duration) },
-              { label: 'run', mapFn: (m) => (m.phase === 'cold' ? 'cold' : `warm ${m.run}`) },
-              { label: 'measure', mapFn: (m) => cell(shortName(r.workspaceRoot, m.name)) },
-            ]),
-          ),
-        ),
       ),
     );
   }
@@ -575,7 +558,7 @@ function renderMarkdown(r: Collected): string {
   sections.push(md.h2('Plugin config files', ...renderPluginConfigFiles(r.pluginConfigFiles)));
   sections.push(md.h2('nx report', ...renderReport(r.report)));
 
-  const nxJsonKeys = ['plugins', 'targetDefaults', 'namedInputs'] as const;
+  const nxJsonKeys = ['plugins', 'targetDefaults'] as const;
   sections.push(
     md.h2(
       'nx.json',
@@ -602,16 +585,9 @@ function renderProcesses(traces: ProcessTrace[], warmRuns: number): string {
   return md.table(traces, [
     { label: 'pid', field: 'pid' },
     { label: 'role', mapFn: (t) => cell(t.role) },
-    { label: 'parent', field: 'ppid' },
     { label: 'started at', mapFn: (t) => `+${ms(t.timeOrigin - earliest)}` },
-    { label: 'measures', mapFn: (t) => t.measures.length },
-    { label: 'cold sum', mapFn: (t) => phaseSum(t, 'cold') },
-    { label: 'warm sum / run', mapFn: (t) => phaseSum(t, 'warm') },
-    {
-      label: 'last measure ends',
-      mapFn: (t) =>
-        `+${ms(t.timeOrigin - earliest + t.measures.reduce((max, m) => Math.max(max, m.startTime + m.duration), 0))}`,
-    },
+    { label: 'cold', mapFn: (t) => phaseSum(t, 'cold') },
+    { label: 'warm / run', mapFn: (t) => phaseSum(t, 'warm') },
   ]);
 }
 
@@ -621,7 +597,7 @@ function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
   for (const t of traces) {
     for (const m of t.measures) {
       if (!KEY_PHASES.some((p) => p.test(m.name))) continue;
-      const phase = shortName(root, m.name);
+      const phase = shortName(root, m.name).replace(/^plugin worker \d+ code loading$/, 'plugin worker code loading');
       const key = `${phase} ${roleKind(t.role)}`;
       const entry = byPhase.get(key) ?? { phase, process: roleKind(t.role), cold: [], warm: [] };
       entry[m.phase].push(m.duration);
@@ -637,14 +613,13 @@ function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
     { label: 'cold', mapFn: (p) => stat(p.cold, (v) => Math.max(...v)) },
     { label: 'warm median', mapFn: (p) => stat(p.warm, median) },
     { label: 'warm max', mapFn: (p) => stat(p.warm, (v) => Math.max(...v)) },
-    { label: 'warm runs', mapFn: (p) => p.warm.length },
   ]);
 }
 
 function renderPluginConfigFiles(plugins: PluginConfigFiles[] | Failure): string[] {
   if ('error' in plugins) return [plugins.error];
   const intro =
-    "Files matched by each loaded plugin's createNodes glob, by basename. One config file can produce more than one project, so this bounds what a plugin contributes rather than counting its projects.";
+    "Files matched by each loaded plugin's createNodes glob, by basename. A config file can produce more than one project, so this bounds a plugin's share rather than counting its projects.";
   return [
     intro,
     ...plugins.map((p) => {
@@ -693,28 +668,6 @@ function renderReport(report: ReportData): string[] {
       { label: 'version', field: 'version' },
     ]),
   );
-  const named = (kind: string) => (name: string) => ({ kind, name });
-  const versioned = (kind: string) => (p: { name: string; version: string }) => ({
-    kind,
-    name: `${p.name} ${p.version}`,
-  });
-  const plugins: { kind: string; name: string }[] = [
-    ...report.registeredPlugins.map(named('registered')),
-    ...report.localPlugins.map(named('local')),
-    ...report.communityPlugins.map(versioned('community')),
-    ...report.powerpackPlugins.map(versioned('powerpack')),
-  ];
-  if (plugins.length) {
-    parts.push(
-      md.h3(
-        'Plugins',
-        md.table(plugins, [
-          { label: 'kind', field: 'kind' },
-          { label: 'plugin', mapFn: (p) => md.code(p.name) },
-        ]),
-      ),
-    );
-  }
   if (report.outOfSyncPackageGroup) {
     const g = report.outOfSyncPackageGroup;
     const misaligned: { name: string; version: string }[] = g.misalignedPackages;

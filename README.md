@@ -75,12 +75,12 @@ The daemon is forced on (`NX_DAEMON=true`) because Nx disables it under CI and i
 ## What the report contains
 
 - Platform, project count, cold and warm wall times.
-- A table of every Nx process that ran: its role (plugin workers are labelled with their plugin), when it started, and the sum of its top-level measures, split into the cold run and a per-run figure for the warm runs. Nested phases count once through the measure that contains them, so a plugin worker's sum is roughly what that plugin cost.
-- Key phases across all processes, with the cold occurrence beside the warm median and max: plugin loading, worker startup, `createNodes`, `createDependencies`, graph serialization, and the client round trip. A phase that stays slow warm costs every command, so that column is the one to watch.
-- A full timeline per process.
-- Per plugin, the files its `createNodes` glob matches, counted by basename. A config file can produce more than one project, so this bounds what a plugin contributes rather than counting its projects.
-- The `nx report` data as tables.
-- The graph-relevant parts of `nx.json`.
+- One row per Nx process (client, daemon, each plugin worker labelled with its plugin) with the sum of its top-level measures, cold and per warm run. Nested measures count once, so a plugin worker's row is roughly what that plugin cost.
+- Key phases with the cold occurrence beside the warm median and max: plugin loading, worker startup, `createNodes`, `createDependencies`, graph serialization, and the client round trip. A phase that stays slow warm costs every command.
+- Per plugin, the files its `createNodes` glob matches, counted by basename. A config file can produce more than one project, so this bounds a plugin's share rather than counting its projects.
+- The `nx report` data as tables, and the `plugins` and `targetDefaults` blocks of `nx.json`.
+
+`graph-perf.json` has everything above plus every recorded measure, tagged with the run it happened in, and the `namedInputs` block.
 
 The raw measures stay in `.nx/workspace-data/perf-logs/` until the next `nx reset`.
 
