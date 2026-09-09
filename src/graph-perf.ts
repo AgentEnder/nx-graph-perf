@@ -17,9 +17,10 @@
  *
  * Source and build: https://github.com/AgentEnder/nx-graph-perf
  *
- * Records land in .nx/workspace-data/perf-logs/<pid of this script>/<pid>.jsonl
- * and are announced to the Nx processes through a marker file, so nothing has to
- * survive the daemon's environment filtering.
+ * Records land in <tmpdir>/nx-graph-perf/<pid of this script>/<pid>.jsonl and
+ * are announced to the Nx processes through a marker file beside the swapped
+ * module, so nothing has to survive the daemon's environment filtering. They
+ * are removed once read; graph-perf.json keeps every measure.
  *
  * NX_DAEMON=true is forced because Nx turns the daemon off under CI and inside
  * Docker, and a daemonless run measures something else.
@@ -142,8 +143,9 @@ interface Workspace {
   require: NodeJS.Require;
   env: NodeJS.ProcessEnv;
   nxBin: string | null;
-  perfLogsRoot: string;
-  session: string;
+  /** nx's perf-logging module, the file the instrument replaces. */
+  perfLogging: string | null;
+  /** Where the instrumented module writes; announced through a marker beside it. */
   sessionDir: string;
 }
 
@@ -180,7 +182,7 @@ function parseArgs(argv: string[]): Options {
     else if (arg === '--instrument') opts.instrumentFile = argv[++i];
     else if (arg === '--help' || arg === '-h') {
       console.log(
-        'usage: node graph-perf.js [--runs N] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]',
+        'usage: node graph-perf.js [--runs CYCLES] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]',
       );
       process.exit(0);
     } else {
@@ -204,8 +206,6 @@ function openWorkspace(root: string): Workspace {
   // carries an environment no CLI client has, and the daemon answers such a
   // change by rebuilding the graph, once now and once for the next client.
   Object.assign(process.env, ENV_OVERRIDES, { NX_DAEMON: 'false' });
-  const perfLogsRoot = path.join(root, '.nx', 'workspace-data', 'perf-logs');
-  const session = String(process.pid);
   // Node's own resolver anchored at the workspace. The ambient `require` is
   // not enough: under jiti its resolve() ignores the `paths` option.
   const require = createRequire(path.join(root, 'package.json'));
@@ -216,9 +216,13 @@ function openWorkspace(root: string): Workspace {
     // The workspace's own nx entry point, run with this node. `npx` would add
     // its own startup to every timing, and on Windows that is a second or more.
     nxBin: resolveFromWorkspace(require, 'nx/bin/nx.js'),
-    perfLogsRoot,
-    session,
-    sessionDir: path.join(perfLogsRoot, session),
+    perfLogging:
+      resolveFromWorkspace(require, 'nx/dist/src/utils/perf-logging.js') ??
+      resolveFromWorkspace(require, 'nx/src/utils/perf-logging.js'),
+    // Records live in this process's temp directory, so `nx reset` cannot
+    // empty them and the workspace stays untouched. Only this process reads it;
+    // the Nx processes learn the path from the marker, not from their env.
+    sessionDir: path.join(os.tmpdir(), 'nx-graph-perf', String(process.pid)),
   };
 }
 
@@ -471,7 +475,7 @@ interface Instrument {
 }
 
 function installInstrument(ws: Workspace, source: string): Instrument | null {
-  const target = resolveNxInternal(ws, 'utils/perf-logging.js');
+  const target = ws.perfLogging;
   if (!target) {
     console.warn('could not locate nx perf-logging module; running without instrumentation');
     return null;
@@ -491,13 +495,18 @@ function installInstrument(ws: Workspace, source: string): Instrument | null {
   return { restore, target };
 }
 
+const markerFor = (ws: Workspace) => (ws.perfLogging ? `${ws.perfLogging}.graph-perf-session` : null);
+
 function announceSession(ws: Workspace): void {
+  const marker = markerFor(ws);
+  if (!marker) return;
   fs.mkdirSync(ws.sessionDir, { recursive: true });
-  fs.writeFileSync(path.join(ws.perfLogsRoot, 'ACTIVE'), ws.session);
+  fs.writeFileSync(marker, ws.sessionDir);
 }
 
 function withdrawSession(ws: Workspace): void {
-  fs.rmSync(path.join(ws.perfLogsRoot, 'ACTIVE'), { force: true });
+  const marker = markerFor(ws);
+  if (marker) fs.rmSync(marker, { force: true });
 }
 
 function readTraces(ws: Workspace, runs: Run[]): ProcessTrace[] {
@@ -519,15 +528,15 @@ function readTraces(ws: Workspace, runs: Run[]): ProcessTrace[] {
     }
     if (!header) continue;
     const timeOrigin = header.timeOrigin;
-    // A measure is cold only if it began before the cold command returned;
-    // anything later, including a worker spawned between commands, had the
-    // on-disk cache. Process time origins and run timestamps share the epoch.
-    const cold = runs[0];
+    // A measure belongs to the latest run started before it. It is cold only
+    // while that cold command is still running; anything after the command
+    // returned, including a worker spawned between commands, had the on-disk
+    // cache. Process time origins and run timestamps share the epoch.
     const measures: MeasureRecord[] = raw.map((m) => {
       const at = timeOrigin + m.startTime;
-      if (at <= cold.endedAt) return { ...m, phase: 'cold', run: cold.index };
-      const run = runs.reduce((current, r) => (r.startedAt <= at ? r : current), runs[1] ?? cold);
-      return { ...m, phase: run.phase === 'cold' ? 'warm' : run.phase, run: run.index };
+      const run = runs.reduce((current, r) => (r.startedAt <= at ? r : current), runs[0]);
+      const phase: Phase = run.phase === 'cold' && at > run.endedAt ? 'warm' : run.phase;
+      return { ...m, phase, run: run.index };
     });
     measures.sort((a, b) => a.startTime - b.startTime);
     traces.push({
@@ -654,52 +663,55 @@ interface Collected {
   workspaceRoot: string;
   system: SystemInfo;
   projectCount: number;
-  coldGraphMs: number;
+  cycles: number;
+  coldMs: number[];
   warmMs: number[];
-  warmMedianMs: number | null;
   semiWarmMs: number[];
   edits: EditPlan[];
   reset: boolean;
   runs: Run[];
-  records: string | null;
+  instrumented: boolean;
   traces: ProcessTrace[];
   report: ReportData;
   pluginConfigFiles: PluginConfigFiles[] | Failure;
   nxJson: NxJsonSummary;
 }
 
+const series = (values: number[]) =>
+  values.length
+    ? `${values.join(', ')} ms${values.length > 1 ? ` (median ${Math.round(median(values))} ms)` : ''}`
+    : 'none';
+
+const countBy = (runs: Run[], phase: Phase) => runs.filter((run) => run.phase === phase).length;
+
 function renderMarkdown(r: Collected): string {
   const sys = r.system;
   const summary = md.ul(
     `Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`,
     `Projects: ${r.projectCount}`,
-    `Cold ${md.code('nx show projects')} after ${md.code('nx reset')}: ${r.coldGraphMs} ms`,
-    `Warm runs: ${r.warmMs.join(', ') || 'none'}${r.warmMs.length ? ` ms (median ${Math.round(median(r.warmMs))} ms)` : ''}`,
-    ...(r.edits.length
-      ? [`Semi-warm runs, each after appending a line to one file: ${r.semiWarmMs.join(', ')} ms`]
-      : []),
-    ...(r.reset ? [] : ['Daemon was not reset, so the cold run is only cold if no daemon was running.']),
+    `Cycles: ${r.cycles}, each ${r.reset ? `${md.code('nx reset')}, ` : ''}cold ${md.code('nx show projects')}, warm, then ${r.edits.length} semi-warm edit${r.edits.length === 1 ? '' : 's'}`,
+    `Cold: ${series(r.coldMs)}`,
+    `Warm: ${series(r.warmMs)}`,
+    ...(r.edits.length ? [`Semi-warm: ${series(r.semiWarmMs)}`] : []),
+    ...(r.reset ? [] : ['Daemon was not reset, so a cold run is only cold if no daemon was running.']),
   );
 
   const sections: string[] = [];
   if (r.traces.length === 0) {
     sections.push('No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.');
   } else {
-    const warmRuns = r.runs.filter((run) => run.phase === 'warm').length;
-    const semiWarmRuns = r.runs.filter((run) => run.phase === 'semi-warm').length;
-    const plural = (n: number) => (n === 1 ? '' : 's');
     sections.push(
       md.h2(
         'Processes',
-        renderProcesses(r.traces, warmRuns, semiWarmRuns),
-        `Sums count nested measures once, through the outermost one, and are per run: ${warmRuns} warm run${plural(warmRuns)}, ${semiWarmRuns} semi-warm run${plural(semiWarmRuns)} after a file edit. Every measure is in graph-perf.json.`,
+        renderProcesses(r.traces, r.runs),
+        `One row per kind of process, across every cycle. Sums count nested measures once, through the outermost one, and are per run of that phase (${countBy(r.runs, 'cold')} cold, ${countBy(r.runs, 'warm')} warm, ${countBy(r.runs, 'semi-warm')} semi-warm). Every measure is in graph-perf.json.`,
       ),
     );
     if (r.edits.length) {
       sections.push(
         md.h2(
           'Semi-warm runs',
-          'One run per plugin whose glob matched a file, editing one of those files, then source-file edits. Daemon is the sum of its top-level measures inside that run.',
+          'One edit per plugin whose glob matched a file, then source-file edits, repeated every cycle. Daemon is the sum of its top-level measures inside that run.',
           renderSemiWarmRuns(r),
         ),
       );
@@ -715,7 +727,7 @@ function renderMarkdown(r: Collected): string {
 
   sections.push(md.h2('Plugin config files', ...renderPluginConfigFiles(r.pluginConfigFiles)));
   if (r.traces.length) sections.push(md.h2('Timelines', ...renderTimelines(r)));
-  sections.push(md.h2('nx report', ...renderReport(r.report, r.traces, r.records !== null)));
+  sections.push(md.h2('nx report', ...renderReport(r.report, r.traces, r.instrumented)));
 
   const nxJsonKeys = ['plugins', 'targetDefaults'] as const;
   sections.push(
@@ -734,34 +746,60 @@ function renderMarkdown(r: Collected): string {
 }
 
 function renderSemiWarmRuns(r: Collected): string {
-  const daemon = r.traces.find((t) => t.role === 'daemon');
-  const rows = r.runs.filter((run) => run.phase === 'semi-warm');
-  return md.table(rows, [
-    { label: 'run', mapFn: (run) => run.index },
-    { label: 'edited file', mapFn: (run) => md.code(run.file ?? '?') },
-    { label: 'matched by', mapFn: (run) => (run.plugin ? cell(run.plugin) : 'no plugin (source file)') },
-    { label: 'client', mapFn: (run) => ms(run.wallMs) },
-    {
-      label: 'daemon',
-      mapFn: (run) => (daemon ? ms(topLevelMs(daemon.measures.filter((m) => m.run === run.index))) : '-'),
-    },
-  ]);
+  const daemons = r.traces.filter((t) => t.role === 'daemon');
+  const daemonMs = (run: Run) => topLevelMs(daemons.flatMap((t) => t.measures.filter((m) => m.run === run.index)));
+  type Row = { file: string; plugin: string | null; client: number[]; daemon: number[] };
+  const byEdit = new Map<string, Row>();
+  for (const run of r.runs) {
+    if (run.phase !== 'semi-warm' || !run.file) continue;
+    const row = byEdit.get(run.file) ?? { file: run.file, plugin: run.plugin ?? null, client: [], daemon: [] };
+    row.client.push(run.wallMs);
+    if (daemons.length) row.daemon.push(daemonMs(run));
+    byEdit.set(run.file, row);
+  }
+  const stat = (values: number[]) => (values.length ? ms(median(values)) : '-');
+  return md.table(
+    [...byEdit.values()],
+    [
+      { label: 'edited file', mapFn: (row) => md.code(row.file) },
+      { label: 'matched by', mapFn: (row) => (row.plugin ? cell(row.plugin) : 'no plugin (source file)') },
+      { label: 'runs', mapFn: (row) => row.client.length },
+      { label: 'client median', mapFn: (row) => stat(row.client) },
+      { label: 'daemon median', mapFn: (row) => stat(row.daemon) },
+    ],
+  );
 }
 
-function renderProcesses(traces: ProcessTrace[], warmRuns: number, semiWarmRuns: number): string {
-  const earliest = Math.min(...traces.map((t) => t.timeOrigin));
-  const perRun: Record<Phase, number> = { cold: 1, warm: warmRuns || 1, 'semi-warm': semiWarmRuns || 1 };
-  const phaseSum = (t: ProcessTrace, phase: Phase) => {
-    const subset = t.measures.filter((m) => m.phase === phase);
-    return subset.length ? ms(topLevelMs(subset) / perRun[phase]) : '-';
+function renderProcesses(traces: ProcessTrace[], runs: Run[]): string {
+  const perRun: Record<Phase, number> = {
+    cold: countBy(runs, 'cold') || 1,
+    warm: countBy(runs, 'warm') || 1,
+    'semi-warm': countBy(runs, 'semi-warm') || 1,
   };
-  return md.table(traces, [
-    { label: 'pid', field: 'pid' },
-    { label: 'role', mapFn: (t) => cell(t.role) },
-    { label: 'started at', mapFn: (t) => `+${ms(t.timeOrigin - earliest)}` },
-    { label: 'cold', mapFn: (t) => phaseSum(t, 'cold') },
-    { label: 'warm / run', mapFn: (t) => phaseSum(t, 'warm') },
-    { label: 'semi-warm / run', mapFn: (t) => phaseSum(t, 'semi-warm') },
+  type Row = { role: string; processes: number; measures: MeasureRecord[]; first: number };
+  const byRole = new Map<string, Row>();
+  for (const t of traces) {
+    const row = byRole.get(t.role) ?? { role: t.role, processes: 0, measures: [], first: t.timeOrigin };
+    row.processes++;
+    // Sums are per process before they are added, so one worker's nesting
+    // never hides another's work.
+    row.measures.push(...t.measures);
+    byRole.set(t.role, row);
+  }
+  const phaseSum = (row: Row, phase: Phase) => {
+    const perProcess = traces
+      .filter((t) => t.role === row.role)
+      .map((t) => topLevelMs(t.measures.filter((m) => m.phase === phase)));
+    const total = perProcess.reduce((a, b) => a + b, 0);
+    return total ? ms(total / perRun[phase]) : '-';
+  };
+  const rows = [...byRole.values()].sort((a, b) => a.first - b.first);
+  return md.table(rows, [
+    { label: 'role', mapFn: (row) => cell(row.role) },
+    { label: 'processes', field: 'processes' },
+    { label: 'cold / run', mapFn: (row) => phaseSum(row, 'cold') },
+    { label: 'warm / run', mapFn: (row) => phaseSum(row, 'warm') },
+    { label: 'semi-warm / run', mapFn: (row) => phaseSum(row, 'semi-warm') },
   ]);
 }
 
@@ -785,7 +823,7 @@ function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
   return md.table(rows, [
     { label: 'phase', mapFn: (p) => cell(p.phase) },
     { label: 'process', field: 'process' },
-    { label: 'cold', mapFn: (p) => stat(p.cold, (v) => Math.max(...v)) },
+    { label: 'cold median', mapFn: (p) => stat(p.cold, median) },
     { label: 'warm median', mapFn: (p) => stat(p.warm, median) },
     { label: 'warm max', mapFn: (p) => stat(p.warm, (v) => Math.max(...v)) },
     { label: 'semi-warm median', mapFn: (p) => stat(p['semi-warm'], median) },
@@ -805,19 +843,19 @@ const mermaidLabel = (text: string) => text.replace(/[:;#]/g, '-');
  */
 function renderTimelines(r: Collected): string[] {
   const parts: string[] = [
-    'Cold and warm only. Bars are top-level measures and key phases; time counts from the start of the first run of that kind.',
+    'First cycle, cold and warm only. Bars are top-level measures and key phases; time counts from the start of that run.',
   ];
   // Semi-warm runs restart every worker per edit, which draws as a wall of
   // bars; the per-run table carries that phase instead.
   for (const phase of ['cold', 'warm'] as Phase[]) {
-    const windows = r.runs.filter((run) => run.phase === phase);
-    if (!windows.length) continue;
-    const t0 = windows[0].startedAt;
+    const first = r.runs.find((run) => run.phase === phase);
+    if (!first) continue;
+    const t0 = first.startedAt;
     const lines = ['gantt', `  title ${phase}`, '  dateFormat x', '  axisFormat %S.%Ls', '  todayMarker off'];
     let bars = 0;
     for (const t of r.traces) {
       const kind = roleKind(t.role);
-      const inPhase = t.measures.filter((m) => m.phase === phase);
+      const inPhase = t.measures.filter((m) => m.phase === phase && m.run === first.index);
       if (!inPhase.length) continue;
       const outer = new Set(topLevel(inPhase));
       const shown = inPhase.filter((m) => outer.has(m) || isKeyPhase(m.name, kind));
@@ -924,97 +962,106 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
   const outDir = path.resolve(ws.root, opts.out);
   fs.mkdirSync(outDir, { recursive: true });
 
-  if (opts.reset) {
-    console.log('nx reset');
-    assertOk('nx reset', nx(ws, ['reset']));
-  }
-
   let instrument: Instrument | null = null;
-  const edits: Edit[] = [];
   if (opts.instrument) {
     const source = opts.instrumentFile
       ? fs.readFileSync(path.resolve(opts.instrumentFile), 'utf8')
       : instrumentSource();
     console.log(`instrumenting nx perf-logging${opts.instrumentFile ? ` from ${opts.instrumentFile}` : ''}`);
     instrument = installInstrument(ws, source);
-    announceSession(ws);
   }
 
+  const runs: Run[] = [];
+  const traces: ProcessTrace[] = [];
+  const edits: Edit[] = [];
+  let projects: string[] = [];
+  let inspection: PluginInspection | Failure = { error: 'plugins were not inspected' };
+
+  const show = (label: string) => {
+    const result = nx(ws, ['show', 'projects', '--json']);
+    assertOk(`nx show projects (${label})`, result);
+    return result;
+  };
+  const record = (phase: Phase, result: CommandResult, extra: Partial<Run> = {}) =>
+    runs.push({
+      index: runs.length,
+      phase,
+      startedAt: result.startedAt,
+      endedAt: result.endedAt,
+      wallMs: result.wallMs,
+      ...extra,
+    });
+
   try {
-    // First run after a reset starts the daemon and builds the graph from nothing.
-    console.log('cold graph construction: nx show projects --json');
-    const cold = nx(ws, ['show', 'projects', '--json']);
-    assertOk('nx show projects', cold);
-    let projects: string[] = [];
-    try {
-      projects = JSON.parse(cold.stdout);
-    } catch {
-      console.error('could not parse `nx show projects --json` output');
-      console.error(cold.stdout.slice(0, 500));
-      process.exit(1);
-    }
-
-    // Subsequent runs hit the daemon's cached graph; their wall time is the
-    // client round trip, which is what a developer feels on every command.
-    const runs: Run[] = [
-      { index: 0, phase: 'cold', startedAt: cold.startedAt, endedAt: cold.endedAt, wallMs: cold.wallMs },
-    ];
-    for (let i = 1; i < opts.runs; i++) {
-      console.log(`warm run ${i} of ${opts.runs - 1}`);
-      const warm = nx(ws, ['show', 'projects', '--json']);
-      assertOk('nx show projects (warm)', warm);
-      runs.push({ index: i, phase: 'warm', startedAt: warm.startedAt, endedAt: warm.endedAt, wallMs: warm.wallMs });
-    }
-    const warmMs = runs.filter((run) => run.phase === 'warm').map((run) => run.wallMs);
-
-    // Plugin loading here spawns its own workers; pause recording so they are
-    // not mistaken for the daemon's.
-    withdrawSession(ws);
-    console.log('plugin config files');
-    const inspection = await readPluginConfigFiles(ws);
-    if (instrument) announceSession(ws);
-
-    // An edited file makes the daemon rehash and rebuild what depends on it.
-    // Each run's window opens at its edit so that work is tagged semi-warm
-    // whether the daemon does it before or during the request.
-    if (opts.edit) {
-      const plan = opts.editFile
-        ? [{ file: opts.editFile, plugin: null }]
-        : planEdits(ws, 'error' in inspection ? new Map() : inspection.matched, opts.sourceEdits);
-      if (!plan.length) console.warn('nothing to edit; skipping semi-warm runs');
-      for (const item of plan) {
-        const edit = installEdit(ws, item);
-        if (edit) edits.push(edit);
+    for (let cycle = 1; cycle <= opts.runs; cycle++) {
+      const tag = `cycle ${cycle} of ${opts.runs}`;
+      if (opts.reset) {
+        console.log(`${tag}: nx reset`);
+        assertOk('nx reset', nx(ws, ['reset']));
       }
-    }
-    for (const [i, edit] of edits.entries()) {
-      console.log(
-        `semi-warm run ${i + 1} of ${edits.length}: editing ${edit.file}${edit.plugin ? ` (${edit.plugin})` : ''}`,
-      );
-      const editedAt = Date.now();
-      edit.touch();
-      await sleep(500);
-      const semiWarm = nx(ws, ['show', 'projects', '--json']);
-      assertOk('nx show projects (semi-warm)', semiWarm);
-      runs.push({
-        index: runs.length,
-        phase: 'semi-warm',
-        startedAt: editedAt,
-        endedAt: semiWarm.endedAt,
-        wallMs: semiWarm.wallMs,
-        file: edit.file,
-        plugin: edit.plugin,
-      });
-    }
-    const semiWarmMs = runs.filter((run) => run.phase === 'semi-warm').map((run) => run.wallMs);
+      if (instrument) announceSession(ws);
 
-    // Stop recording before anything that is not graph construction runs.
-    withdrawSession(ws);
-    const traces = instrument ? readTraces(ws, runs) : [];
+      // The first request after a reset starts the daemon and builds the
+      // graph from nothing; the next one is the round trip a developer feels.
+      console.log(`${tag}: cold nx show projects --json`);
+      const cold = show('cold');
+      record('cold', cold);
+      if (cycle === 1) {
+        try {
+          projects = JSON.parse(cold.stdout);
+        } catch {
+          console.error('could not parse `nx show projects --json` output');
+          console.error(cold.stdout.slice(0, 500));
+          process.exit(1);
+        }
+      }
+      console.log(`${tag}: warm`);
+      record('warm', show('warm'));
+
+      if (cycle === 1) {
+        // Plugin loading here spawns its own workers; pause recording so they
+        // are not mistaken for the daemon's. The plan is reused every cycle so
+        // the cycles are comparable.
+        withdrawSession(ws);
+        console.log(`${tag}: plugin config files`);
+        inspection = await readPluginConfigFiles(ws);
+        if (instrument) announceSession(ws);
+        if (opts.edit) {
+          const plan = opts.editFile
+            ? [{ file: opts.editFile, plugin: null }]
+            : planEdits(ws, 'error' in inspection ? new Map() : inspection.matched, opts.sourceEdits);
+          if (!plan.length) console.warn('nothing to edit; skipping semi-warm runs');
+          for (const item of plan) {
+            const edit = installEdit(ws, item);
+            if (edit) edits.push(edit);
+          }
+        }
+      }
+
+      // An edited file makes the daemon rehash and rebuild what depends on it.
+      // Each run's window opens at its edit so that work is tagged semi-warm
+      // whether the daemon does it before or during the request.
+      for (const [i, edit] of edits.entries()) {
+        console.log(
+          `${tag}: semi-warm ${i + 1} of ${edits.length}, editing ${edit.file}${edit.plugin ? ` (${edit.plugin})` : ''}`,
+        );
+        const editedAt = Date.now();
+        edit.touch();
+        await sleep(500);
+        const semiWarm = show('semi-warm');
+        record('semi-warm', { ...semiWarm, startedAt: editedAt }, { file: edit.file, plugin: edit.plugin });
+      }
+
+      withdrawSession(ws);
+    }
+    if (instrument) {
+      traces.push(...readTraces(ws, runs));
+      fs.rmSync(ws.sessionDir, { recursive: true, force: true });
+    }
 
     console.log('nx report data');
     const report = await readReportData(ws);
-    const pluginConfigFiles = 'error' in inspection ? inspection : inspection.summary;
+    const byPhase = (phase: Phase) => runs.filter((run) => run.phase === phase).map((run) => Math.round(run.wallMs));
 
     const result: Collected = {
       collectedAt: startedAt,
@@ -1029,26 +1076,27 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
         node: process.version,
       },
       projectCount: projects.length,
-      coldGraphMs: Math.round(cold.wallMs),
-      warmMs: warmMs.map(Math.round),
-      warmMedianMs: warmMs.length ? Math.round(median(warmMs)) : null,
-      semiWarmMs: semiWarmMs.map(Math.round),
+      cycles: opts.runs,
+      coldMs: byPhase('cold'),
+      warmMs: byPhase('warm'),
+      semiWarmMs: byPhase('semi-warm'),
       edits: edits.map(({ file, plugin }) => ({ file, plugin })),
       reset: opts.reset,
       runs,
-      records: instrument ? path.relative(ws.root, ws.sessionDir) : null,
+      instrumented: instrument !== null,
       traces,
       report,
-      pluginConfigFiles,
+      pluginConfigFiles: 'error' in inspection ? inspection : inspection.summary,
       nxJson: readNxJson(ws.root),
     };
 
     fs.writeFileSync(path.join(outDir, 'graph-perf.md'), renderMarkdown(result));
     fs.writeFileSync(path.join(outDir, 'graph-perf.json'), JSON.stringify(result, null, 2) + '\n');
 
+    const med = (values: number[]) => (values.length ? `${Math.round(median(values))}ms` : 'n/a');
     console.log(`wrote ${path.join(outDir, 'graph-perf.md')} and graph-perf.json`);
     console.log(
-      `projects ${projects.length}, cold ${result.coldGraphMs}ms, warm median ${result.warmMedianMs ?? 'n/a'}ms, semi-warm ${semiWarmMs.length ? `${semiWarmMs.map(Math.round).join('/')}ms` : 'n/a'}, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`,
+      `projects ${projects.length}, cycles ${opts.runs}, cold median ${med(result.coldMs)}, warm median ${med(result.warmMs)}, semi-warm median ${med(result.semiWarmMs)}, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`,
     );
   } finally {
     for (const edit of edits) edit.restore();

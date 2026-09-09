@@ -241,7 +241,7 @@ function assert(check, message, allowByPass = true) {
 //#endregion
 //#region src/instrument.ts
 function instrumentSource() {
-	return "\"use strict\";\n// Drop-in replacement for nx/dist/src/utils/perf-logging.js, installed by\n// graph-perf.js for the duration of a measurement and restored afterwards.\n//\n// It keeps the original behaviour (perf lines when NX_PERF_LOGGING=true,\n// analytics for tracked measures) and additionally appends every measure as one\n// JSON line to <workspace-data>/perf-logs/<session>/<pid>.jsonl, where the\n// session name is read from <workspace-data>/perf-logs/ACTIVE. Without that\n// marker the module behaves exactly like the original, so leaving it installed\n// by accident costs nothing.\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst perf_hooks_1 = require(\"perf_hooks\");\nconst fs = require(\"fs\");\nconst path = require(\"path\");\n\nfunction isTrackedDetail(detail) {\n  return typeof detail === \"object\" && detail !== null && detail.track === true;\n}\n\nlet recorder = { session: null, file: null };\nlet perfLogsRoot = null;\n\n// Re-reads the marker on every batch: a long-lived daemon outlives the session\n// that started it, and its measures must land with whichever session is active\n// now, or nowhere when none is.\nfunction getRecorder() {\n    try {\n        if (!perfLogsRoot) {\n            const { workspaceDataDirectory } = require('./cache-directory');\n            perfLogsRoot = path.join(workspaceDataDirectory, 'perf-logs');\n        }\n        const marker = path.join(perfLogsRoot, 'ACTIVE');\n        const session = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').trim() : '';\n        if (!session) {\n            recorder = { session: null, file: null };\n            return recorder;\n        }\n        if (recorder.session === session) return recorder;\n        const dir = path.join(perfLogsRoot, session);\n        fs.mkdirSync(dir, { recursive: true });\n        const file = path.join(dir, `${process.pid}.jsonl`);\n        // Header line, so the file says which process it belongs to.\n        fs.appendFileSync(file, JSON.stringify({\n            kind: 'process',\n            pid: process.pid,\n            ppid: process.ppid,\n            argv: process.argv,\n            execArgv: process.execArgv,\n            cwd: process.cwd(),\n            node: process.version,\n            timeOrigin: perf_hooks_1.performance.timeOrigin,\n        }) + '\\n');\n        recorder = { session, file };\n    } catch {\n        recorder = { session: null, file: null };\n    }\n    return recorder;\n}\n\nfunction safeDetail(detail) {\n  if (detail === undefined || detail === null) return null;\n  try {\n    return JSON.parse(JSON.stringify(detail));\n  } catch {\n    return String(detail);\n  }\n}\n\nnew perf_hooks_1.PerformanceObserver((list) => {\n  // observer is configured for 'measure' entries only (see .observe call below)\n  const entries = list.getEntries();\n  const rec = getRecorder();\n  if (rec.file) {\n    let lines = \"\";\n    for (const entry of entries) {\n      lines +=\n        JSON.stringify({\n          kind: \"measure\",\n          pid: process.pid,\n          name: entry.name,\n          startTime: entry.startTime,\n          duration: entry.duration,\n          detail: safeDetail(entry.detail),\n        }) + \"\\n\";\n    }\n    try {\n      fs.appendFileSync(rec.file, lines);\n    } catch {\n      // Recording is best effort; never break the process being measured.\n    }\n  }\n  const logEnabled = process.env.NX_PERF_LOGGING === \"true\";\n  const tracked = entries.filter((e) => isTrackedDetail(e.detail));\n  // Short-circuit before loading analytics / daemon logger (~60ms of native\n  // binding + module init) when there's nothing to do.\n  if (!logEnabled && tracked.length === 0) return;\n  if (logEnabled) {\n    const { isOnDaemon } = require(\"../daemon/is-on-daemon\");\n    const { serverLogger } = require(\"../daemon/logger\");\n    const { logger } = require(\"./logger\");\n    const log = isOnDaemon() ? (msg) => serverLogger.log(msg) : (msg) => logger.warn(msg);\n    for (const entry of entries) {\n      log(`Time taken for '${entry.name}' ${entry.duration}ms`);\n    }\n  }\n  if (tracked.length === 0) return;\n  const { customDimensions, reportEvent } = require(\"../analytics\");\n  if (!customDimensions) return;\n  const dimensionValues = new Set(Object.values(customDimensions));\n  for (const entry of tracked) {\n    const { track, ...rest } = entry.detail;\n    const params = {\n      [customDimensions.duration]: entry.duration,\n    };\n    for (const [key, value] of Object.entries(rest)) {\n      if (dimensionValues.has(key)) params[key] = value;\n    }\n    reportEvent(entry.name, params);\n  }\n}).observe({ entryTypes: [\"measure\"] });\n";
+	return "\"use strict\";\n// Drop-in replacement for nx/dist/src/utils/perf-logging.js, installed by\n// graph-perf.js for the duration of a measurement and restored afterwards.\n//\n// It keeps the original behaviour (perf lines when NX_PERF_LOGGING=true,\n// analytics for tracked measures) and additionally appends every measure as one\n// JSON line to <session dir>/<pid>.jsonl, where the session directory is read\n// from a marker file beside this module. Without that marker the module\n// behaves exactly like the original, so leaving it installed by accident costs\n// nothing.\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst perf_hooks_1 = require(\"perf_hooks\");\nconst fs = require(\"fs\");\nconst path = require(\"path\");\n\nfunction isTrackedDetail(detail) {\n  return typeof detail === \"object\" && detail !== null && detail.track === true;\n}\n\nlet recorder = { session: null, file: null };\n// Written by graph-perf.js next to this module; holds the session directory.\nconst marker = path.join(__dirname, 'perf-logging.js.graph-perf-session');\n\n// Re-reads the marker on every batch: a long-lived daemon outlives the session\n// that started it, and its measures must land with whichever session is active\n// now, or nowhere when none is.\nfunction getRecorder() {\n    try {\n        const session = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').trim() : '';\n        if (!session) {\n            recorder = { session: null, file: null };\n            return recorder;\n        }\n        if (recorder.session === session) return recorder;\n        const dir = session;\n        fs.mkdirSync(dir, { recursive: true });\n        const file = path.join(dir, `${process.pid}.jsonl`);\n        // Header line, so the file says which process it belongs to.\n        fs.appendFileSync(file, JSON.stringify({\n            kind: 'process',\n            pid: process.pid,\n            ppid: process.ppid,\n            argv: process.argv,\n            execArgv: process.execArgv,\n            cwd: process.cwd(),\n            node: process.version,\n            timeOrigin: perf_hooks_1.performance.timeOrigin,\n        }) + '\\n');\n        recorder = { session, file };\n    } catch {\n        recorder = { session: null, file: null };\n    }\n    return recorder;\n}\n\nfunction safeDetail(detail) {\n  if (detail === undefined || detail === null) return null;\n  try {\n    return JSON.parse(JSON.stringify(detail));\n  } catch {\n    return String(detail);\n  }\n}\n\nnew perf_hooks_1.PerformanceObserver((list) => {\n  // observer is configured for 'measure' entries only (see .observe call below)\n  const entries = list.getEntries();\n  const rec = getRecorder();\n  if (rec.file) {\n    let lines = \"\";\n    for (const entry of entries) {\n      lines +=\n        JSON.stringify({\n          kind: \"measure\",\n          pid: process.pid,\n          name: entry.name,\n          startTime: entry.startTime,\n          duration: entry.duration,\n          detail: safeDetail(entry.detail),\n        }) + \"\\n\";\n    }\n    try {\n      fs.appendFileSync(rec.file, lines);\n    } catch {\n      // Recording is best effort; never break the process being measured.\n    }\n  }\n  const logEnabled = process.env.NX_PERF_LOGGING === \"true\";\n  const tracked = entries.filter((e) => isTrackedDetail(e.detail));\n  // Short-circuit before loading analytics / daemon logger (~60ms of native\n  // binding + module init) when there's nothing to do.\n  if (!logEnabled && tracked.length === 0) return;\n  if (logEnabled) {\n    const { isOnDaemon } = require(\"../daemon/is-on-daemon\");\n    const { serverLogger } = require(\"../daemon/logger\");\n    const { logger } = require(\"./logger\");\n    const log = isOnDaemon() ? (msg) => serverLogger.log(msg) : (msg) => logger.warn(msg);\n    for (const entry of entries) {\n      log(`Time taken for '${entry.name}' ${entry.duration}ms`);\n    }\n  }\n  if (tracked.length === 0) return;\n  const { customDimensions, reportEvent } = require(\"../analytics\");\n  if (!customDimensions) return;\n  const dimensionValues = new Set(Object.values(customDimensions));\n  for (const entry of tracked) {\n    const { track, ...rest } = entry.detail;\n    const params = {\n      [customDimensions.duration]: entry.duration,\n    };\n    for (const [key, value] of Object.entries(rest)) {\n      if (dimensionValues.has(key)) params[key] = value;\n    }\n    reportEvent(entry.name, params);\n  }\n}).observe({ entryTypes: [\"measure\"] });\n";
 }
 
 //#endregion
@@ -265,9 +265,10 @@ function instrumentSource() {
 *
 * Source and build: https://github.com/AgentEnder/nx-graph-perf
 *
-* Records land in .nx/workspace-data/perf-logs/<pid of this script>/<pid>.jsonl
-* and are announced to the Nx processes through a marker file, so nothing has to
-* survive the daemon's environment filtering.
+* Records land in <tmpdir>/nx-graph-perf/<pid of this script>/<pid>.jsonl and
+* are announced to the Nx processes through a marker file beside the swapped
+* module, so nothing has to survive the daemon's environment filtering. They
+* are removed once read; graph-perf.json keeps every measure.
 *
 * NX_DAEMON=true is forced because Nx turns the daemon off under CI and inside
 * Docker, and a daemonless run measures something else.
@@ -300,7 +301,7 @@ function parseArgs(argv) {
 		else if (arg === "--no-instrument") opts.instrument = false;
 		else if (arg === "--instrument") opts.instrumentFile = argv[++i];
 		else if (arg === "--help" || arg === "-h") {
-			console.log("usage: node graph-perf.js [--runs N] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]");
+			console.log("usage: node graph-perf.js [--runs CYCLES] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]");
 			process.exit(0);
 		} else {
 			console.error(`unknown argument: ${arg}`);
@@ -313,8 +314,6 @@ function openWorkspace(root) {
 	for (const key of Object.keys(process.env)) if (key === "CI" || /^NX_TASK_/.test(key) || INJECTED_BY_NX.has(key)) delete process.env[key];
 	const inheritedEnv = { ...process.env };
 	Object.assign(process.env, ENV_OVERRIDES, { NX_DAEMON: "false" });
-	const perfLogsRoot = node_path.default.join(root, ".nx", "workspace-data", "perf-logs");
-	const session = String(process.pid);
 	const require$1 = (0, node_module.createRequire)(node_path.default.join(root, "package.json"));
 	return {
 		root,
@@ -324,9 +323,8 @@ function openWorkspace(root) {
 			...ENV_OVERRIDES
 		},
 		nxBin: resolveFromWorkspace(require$1, "nx/bin/nx.js"),
-		perfLogsRoot,
-		session,
-		sessionDir: node_path.default.join(perfLogsRoot, session)
+		perfLogging: resolveFromWorkspace(require$1, "nx/dist/src/utils/perf-logging.js") ?? resolveFromWorkspace(require$1, "nx/src/utils/perf-logging.js"),
+		sessionDir: node_path.default.join(node_os.default.tmpdir(), "nx-graph-perf", String(process.pid))
 	};
 }
 function resolveFromWorkspace(require$2, request) {
@@ -539,7 +537,7 @@ function installEdit(ws, plan) {
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function installInstrument(ws, source) {
-	const target = resolveNxInternal(ws, "utils/perf-logging.js");
+	const target = ws.perfLogging;
 	if (!target) {
 		console.warn("could not locate nx perf-logging module; running without instrumentation");
 		return null;
@@ -560,12 +558,16 @@ function installInstrument(ws, source) {
 		target
 	};
 }
+const markerFor = (ws) => ws.perfLogging ? `${ws.perfLogging}.graph-perf-session` : null;
 function announceSession(ws) {
+	const marker = markerFor(ws);
+	if (!marker) return;
 	node_fs.default.mkdirSync(ws.sessionDir, { recursive: true });
-	node_fs.default.writeFileSync(node_path.default.join(ws.perfLogsRoot, "ACTIVE"), ws.session);
+	node_fs.default.writeFileSync(marker, ws.sessionDir);
 }
 function withdrawSession(ws) {
-	node_fs.default.rmSync(node_path.default.join(ws.perfLogsRoot, "ACTIVE"), { force: true });
+	const marker = markerFor(ws);
+	if (marker) node_fs.default.rmSync(marker, { force: true });
 }
 function readTraces(ws, runs) {
 	if (!node_fs.default.existsSync(ws.sessionDir)) return [];
@@ -584,18 +586,13 @@ function readTraces(ws, runs) {
 		}
 		if (!header) continue;
 		const timeOrigin = header.timeOrigin;
-		const cold = runs[0];
 		const measures = raw.map((m) => {
 			const at = timeOrigin + m.startTime;
-			if (at <= cold.endedAt) return {
-				...m,
-				phase: "cold",
-				run: cold.index
-			};
-			const run = runs.reduce((current, r) => r.startedAt <= at ? r : current, runs[1] ?? cold);
+			const run = runs.reduce((current, r) => r.startedAt <= at ? r : current, runs[0]);
+			const phase = run.phase === "cold" && at > run.endedAt ? "warm" : run.phase;
 			return {
 				...m,
-				phase: run.phase === "cold" ? "warm" : run.phase,
+				phase,
 				run: run.index
 			};
 		});
@@ -707,86 +704,107 @@ const KEY_PHASES = [
 		role: "client"
 	}
 ];
+const series = (values) => values.length ? `${values.join(", ")} ms${values.length > 1 ? ` (median ${Math.round(median(values))} ms)` : ""}` : "none";
+const countBy = (runs, phase) => runs.filter((run) => run.phase === phase).length;
 function renderMarkdown(r) {
 	const sys = r.system;
-	const summary = ul(`Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`, `Projects: ${r.projectCount}`, `Cold ${code("nx show projects")} after ${code("nx reset")}: ${r.coldGraphMs} ms`, `Warm runs: ${r.warmMs.join(", ") || "none"}${r.warmMs.length ? ` ms (median ${Math.round(median(r.warmMs))} ms)` : ""}`, ...r.edits.length ? [`Semi-warm runs, each after appending a line to one file: ${r.semiWarmMs.join(", ")} ms`] : [], ...r.reset ? [] : ["Daemon was not reset, so the cold run is only cold if no daemon was running."]);
+	const summary = ul(`Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`, `Projects: ${r.projectCount}`, `Cycles: ${r.cycles}, each ${r.reset ? `${code("nx reset")}, ` : ""}cold ${code("nx show projects")}, warm, then ${r.edits.length} semi-warm edit${r.edits.length === 1 ? "" : "s"}`, `Cold: ${series(r.coldMs)}`, `Warm: ${series(r.warmMs)}`, ...r.edits.length ? [`Semi-warm: ${series(r.semiWarmMs)}`] : [], ...r.reset ? [] : ["Daemon was not reset, so a cold run is only cold if no daemon was running."]);
 	const sections = [];
 	if (r.traces.length === 0) sections.push("No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.");
 	else {
-		const warmRuns = r.runs.filter((run) => run.phase === "warm").length;
-		const semiWarmRuns = r.runs.filter((run) => run.phase === "semi-warm").length;
-		const plural = (n) => n === 1 ? "" : "s";
-		sections.push(h2("Processes", renderProcesses(r.traces, warmRuns, semiWarmRuns), `Sums count nested measures once, through the outermost one, and are per run: ${warmRuns} warm run${plural(warmRuns)}, ${semiWarmRuns} semi-warm run${plural(semiWarmRuns)} after a file edit. Every measure is in graph-perf.json.`));
-		if (r.edits.length) sections.push(h2("Semi-warm runs", "One run per plugin whose glob matched a file, editing one of those files, then source-file edits. Daemon is the sum of its top-level measures inside that run.", renderSemiWarmRuns(r)));
+		sections.push(h2("Processes", renderProcesses(r.traces, r.runs), `One row per kind of process, across every cycle. Sums count nested measures once, through the outermost one, and are per run of that phase (${countBy(r.runs, "cold")} cold, ${countBy(r.runs, "warm")} warm, ${countBy(r.runs, "semi-warm")} semi-warm). Every measure is in graph-perf.json.`));
+		if (r.edits.length) sections.push(h2("Semi-warm runs", "One edit per plugin whose glob matched a file, then source-file edits, repeated every cycle. Daemon is the sum of its top-level measures inside that run.", renderSemiWarmRuns(r)));
 		sections.push(h2("Key phases", "A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.", renderKeyPhases(r.workspaceRoot, r.traces)));
 	}
 	sections.push(h2("Plugin config files", ...renderPluginConfigFiles(r.pluginConfigFiles)));
 	if (r.traces.length) sections.push(h2("Timelines", ...renderTimelines(r)));
-	sections.push(h2("nx report", ...renderReport(r.report, r.traces, r.records !== null)));
+	sections.push(h2("nx report", ...renderReport(r.report, r.traces, r.instrumented)));
 	sections.push(h2("nx.json", ...["plugins", "targetDefaults"].map((key) => h3(key, codeBlock(JSON.stringify("error" in r.nxJson ? r.nxJson.error : r.nxJson[key] ?? null, null, 2), "json")))));
 	return h1("Nx graph construction", summary, ...sections) + "\n";
 }
 function renderSemiWarmRuns(r) {
-	const daemon = r.traces.find((t) => t.role === "daemon");
-	const rows = r.runs.filter((run) => run.phase === "semi-warm");
-	return table(rows, [
-		{
-			label: "run",
-			mapFn: (run) => run.index
-		},
+	const daemons = r.traces.filter((t) => t.role === "daemon");
+	const daemonMs = (run) => topLevelMs(daemons.flatMap((t) => t.measures.filter((m) => m.run === run.index)));
+	const byEdit = /* @__PURE__ */ new Map();
+	for (const run of r.runs) {
+		if (run.phase !== "semi-warm" || !run.file) continue;
+		const row = byEdit.get(run.file) ?? {
+			file: run.file,
+			plugin: run.plugin ?? null,
+			client: [],
+			daemon: []
+		};
+		row.client.push(run.wallMs);
+		if (daemons.length) row.daemon.push(daemonMs(run));
+		byEdit.set(run.file, row);
+	}
+	const stat = (values) => values.length ? ms(median(values)) : "-";
+	return table([...byEdit.values()], [
 		{
 			label: "edited file",
-			mapFn: (run) => code(run.file ?? "?")
+			mapFn: (row) => code(row.file)
 		},
 		{
 			label: "matched by",
-			mapFn: (run) => run.plugin ? cell(run.plugin) : "no plugin (source file)"
+			mapFn: (row) => row.plugin ? cell(row.plugin) : "no plugin (source file)"
 		},
 		{
-			label: "client",
-			mapFn: (run) => ms(run.wallMs)
+			label: "runs",
+			mapFn: (row) => row.client.length
 		},
 		{
-			label: "daemon",
-			mapFn: (run) => daemon ? ms(topLevelMs(daemon.measures.filter((m) => m.run === run.index))) : "-"
+			label: "client median",
+			mapFn: (row) => stat(row.client)
+		},
+		{
+			label: "daemon median",
+			mapFn: (row) => stat(row.daemon)
 		}
 	]);
 }
-function renderProcesses(traces, warmRuns, semiWarmRuns) {
-	const earliest = Math.min(...traces.map((t) => t.timeOrigin));
+function renderProcesses(traces, runs) {
 	const perRun = {
-		cold: 1,
-		warm: warmRuns || 1,
-		"semi-warm": semiWarmRuns || 1
+		cold: countBy(runs, "cold") || 1,
+		warm: countBy(runs, "warm") || 1,
+		"semi-warm": countBy(runs, "semi-warm") || 1
 	};
-	const phaseSum = (t, phase) => {
-		const subset = t.measures.filter((m) => m.phase === phase);
-		return subset.length ? ms(topLevelMs(subset) / perRun[phase]) : "-";
+	const byRole = /* @__PURE__ */ new Map();
+	for (const t of traces) {
+		const row = byRole.get(t.role) ?? {
+			role: t.role,
+			processes: 0,
+			measures: [],
+			first: t.timeOrigin
+		};
+		row.processes++;
+		row.measures.push(...t.measures);
+		byRole.set(t.role, row);
+	}
+	const phaseSum = (row, phase) => {
+		const total = traces.filter((t) => t.role === row.role).map((t) => topLevelMs(t.measures.filter((m) => m.phase === phase))).reduce((a, b) => a + b, 0);
+		return total ? ms(total / perRun[phase]) : "-";
 	};
-	return table(traces, [
-		{
-			label: "pid",
-			field: "pid"
-		},
+	const rows = [...byRole.values()].sort((a, b) => a.first - b.first);
+	return table(rows, [
 		{
 			label: "role",
-			mapFn: (t) => cell(t.role)
+			mapFn: (row) => cell(row.role)
 		},
 		{
-			label: "started at",
-			mapFn: (t) => `+${ms(t.timeOrigin - earliest)}`
+			label: "processes",
+			field: "processes"
 		},
 		{
-			label: "cold",
-			mapFn: (t) => phaseSum(t, "cold")
+			label: "cold / run",
+			mapFn: (row) => phaseSum(row, "cold")
 		},
 		{
 			label: "warm / run",
-			mapFn: (t) => phaseSum(t, "warm")
+			mapFn: (row) => phaseSum(row, "warm")
 		},
 		{
 			label: "semi-warm / run",
-			mapFn: (t) => phaseSum(t, "semi-warm")
+			mapFn: (row) => phaseSum(row, "semi-warm")
 		}
 	]);
 }
@@ -820,8 +838,8 @@ function renderKeyPhases(root, traces) {
 			field: "process"
 		},
 		{
-			label: "cold",
-			mapFn: (p) => stat(p.cold, (v) => Math.max(...v))
+			label: "cold median",
+			mapFn: (p) => stat(p.cold, median)
 		},
 		{
 			label: "warm median",
@@ -846,11 +864,11 @@ const mermaidLabel = (text) => text.replace(/[:;#]/g, "-");
 * Times count from the phase's first run window.
 */
 function renderTimelines(r) {
-	const parts = ["Cold and warm only. Bars are top-level measures and key phases; time counts from the start of the first run of that kind."];
+	const parts = ["First cycle, cold and warm only. Bars are top-level measures and key phases; time counts from the start of that run."];
 	for (const phase of ["cold", "warm"]) {
-		const windows = r.runs.filter((run) => run.phase === phase);
-		if (!windows.length) continue;
-		const t0 = windows[0].startedAt;
+		const first = r.runs.find((run) => run.phase === phase);
+		if (!first) continue;
+		const t0 = first.startedAt;
 		const lines = [
 			"gantt",
 			`  title ${phase}`,
@@ -861,7 +879,7 @@ function renderTimelines(r) {
 		let bars = 0;
 		for (const t of r.traces) {
 			const kind = roleKind(t.role);
-			const inPhase = t.measures.filter((m) => m.phase === phase);
+			const inPhase = t.measures.filter((m) => m.phase === phase && m.run === first.index);
 			if (!inPhase.length) continue;
 			const outer = new Set(topLevel(inPhase));
 			const shown = inPhase.filter((m) => outer.has(m) || isKeyPhase(m.name, kind));
@@ -938,100 +956,96 @@ async function run(argv, workspaceRoot) {
 	const startedAt = (/* @__PURE__ */ new Date()).toISOString();
 	const outDir = node_path.default.resolve(ws.root, opts.out);
 	node_fs.default.mkdirSync(outDir, { recursive: true });
-	if (opts.reset) {
-		console.log("nx reset");
-		assertOk("nx reset", nx(ws, ["reset"]));
-	}
 	let instrument = null;
-	const edits = [];
 	if (opts.instrument) {
 		const source = opts.instrumentFile ? node_fs.default.readFileSync(node_path.default.resolve(opts.instrumentFile), "utf8") : instrumentSource();
 		console.log(`instrumenting nx perf-logging${opts.instrumentFile ? ` from ${opts.instrumentFile}` : ""}`);
 		instrument = installInstrument(ws, source);
-		announceSession(ws);
 	}
-	try {
-		console.log("cold graph construction: nx show projects --json");
-		const cold = nx(ws, [
+	const runs = [];
+	const traces = [];
+	const edits = [];
+	let projects = [];
+	let inspection = { error: "plugins were not inspected" };
+	const show = (label) => {
+		const result = nx(ws, [
 			"show",
 			"projects",
 			"--json"
 		]);
-		assertOk("nx show projects", cold);
-		let projects = [];
-		try {
-			projects = JSON.parse(cold.stdout);
-		} catch {
-			console.error("could not parse `nx show projects --json` output");
-			console.error(cold.stdout.slice(0, 500));
-			process.exit(1);
-		}
-		const runs = [{
-			index: 0,
-			phase: "cold",
-			startedAt: cold.startedAt,
-			endedAt: cold.endedAt,
-			wallMs: cold.wallMs
-		}];
-		for (let i = 1; i < opts.runs; i++) {
-			console.log(`warm run ${i} of ${opts.runs - 1}`);
-			const warm = nx(ws, [
-				"show",
-				"projects",
-				"--json"
-			]);
-			assertOk("nx show projects (warm)", warm);
-			runs.push({
-				index: i,
-				phase: "warm",
-				startedAt: warm.startedAt,
-				endedAt: warm.endedAt,
-				wallMs: warm.wallMs
-			});
-		}
-		const warmMs = runs.filter((run) => run.phase === "warm").map((run) => run.wallMs);
-		withdrawSession(ws);
-		console.log("plugin config files");
-		const inspection = await readPluginConfigFiles(ws);
-		if (instrument) announceSession(ws);
-		if (opts.edit) {
-			const plan = opts.editFile ? [{
-				file: opts.editFile,
-				plugin: null
-			}] : planEdits(ws, "error" in inspection ? /* @__PURE__ */ new Map() : inspection.matched, opts.sourceEdits);
-			if (!plan.length) console.warn("nothing to edit; skipping semi-warm runs");
-			for (const item of plan) {
-				const edit = installEdit(ws, item);
-				if (edit) edits.push(edit);
+		assertOk(`nx show projects (${label})`, result);
+		return result;
+	};
+	const record = (phase, result, extra = {}) => runs.push({
+		index: runs.length,
+		phase,
+		startedAt: result.startedAt,
+		endedAt: result.endedAt,
+		wallMs: result.wallMs,
+		...extra
+	});
+	try {
+		for (let cycle = 1; cycle <= opts.runs; cycle++) {
+			const tag = `cycle ${cycle} of ${opts.runs}`;
+			if (opts.reset) {
+				console.log(`${tag}: nx reset`);
+				assertOk("nx reset", nx(ws, ["reset"]));
 			}
+			if (instrument) announceSession(ws);
+			console.log(`${tag}: cold nx show projects --json`);
+			const cold = show("cold");
+			record("cold", cold);
+			if (cycle === 1) try {
+				projects = JSON.parse(cold.stdout);
+			} catch {
+				console.error("could not parse `nx show projects --json` output");
+				console.error(cold.stdout.slice(0, 500));
+				process.exit(1);
+			}
+			console.log(`${tag}: warm`);
+			record("warm", show("warm"));
+			if (cycle === 1) {
+				withdrawSession(ws);
+				console.log(`${tag}: plugin config files`);
+				inspection = await readPluginConfigFiles(ws);
+				if (instrument) announceSession(ws);
+				if (opts.edit) {
+					const plan = opts.editFile ? [{
+						file: opts.editFile,
+						plugin: null
+					}] : planEdits(ws, "error" in inspection ? /* @__PURE__ */ new Map() : inspection.matched, opts.sourceEdits);
+					if (!plan.length) console.warn("nothing to edit; skipping semi-warm runs");
+					for (const item of plan) {
+						const edit = installEdit(ws, item);
+						if (edit) edits.push(edit);
+					}
+				}
+			}
+			for (const [i, edit] of edits.entries()) {
+				console.log(`${tag}: semi-warm ${i + 1} of ${edits.length}, editing ${edit.file}${edit.plugin ? ` (${edit.plugin})` : ""}`);
+				const editedAt = Date.now();
+				edit.touch();
+				await sleep(500);
+				record("semi-warm", {
+					...show("semi-warm"),
+					startedAt: editedAt
+				}, {
+					file: edit.file,
+					plugin: edit.plugin
+				});
+			}
+			withdrawSession(ws);
 		}
-		for (const [i, edit] of edits.entries()) {
-			console.log(`semi-warm run ${i + 1} of ${edits.length}: editing ${edit.file}${edit.plugin ? ` (${edit.plugin})` : ""}`);
-			const editedAt = Date.now();
-			edit.touch();
-			await sleep(500);
-			const semiWarm = nx(ws, [
-				"show",
-				"projects",
-				"--json"
-			]);
-			assertOk("nx show projects (semi-warm)", semiWarm);
-			runs.push({
-				index: runs.length,
-				phase: "semi-warm",
-				startedAt: editedAt,
-				endedAt: semiWarm.endedAt,
-				wallMs: semiWarm.wallMs,
-				file: edit.file,
-				plugin: edit.plugin
+		if (instrument) {
+			traces.push(...readTraces(ws, runs));
+			node_fs.default.rmSync(ws.sessionDir, {
+				recursive: true,
+				force: true
 			});
 		}
-		const semiWarmMs = runs.filter((run) => run.phase === "semi-warm").map((run) => run.wallMs);
-		withdrawSession(ws);
-		const traces = instrument ? readTraces(ws, runs) : [];
 		console.log("nx report data");
 		const report = await readReportData(ws);
-		const pluginConfigFiles = "error" in inspection ? inspection : inspection.summary;
+		const byPhase = (phase) => runs.filter((run) => run.phase === phase).map((run) => Math.round(run.wallMs));
 		const result = {
 			collectedAt: startedAt,
 			workspaceRoot: ws.root,
@@ -1045,26 +1059,27 @@ async function run(argv, workspaceRoot) {
 				node: process.version
 			},
 			projectCount: projects.length,
-			coldGraphMs: Math.round(cold.wallMs),
-			warmMs: warmMs.map(Math.round),
-			warmMedianMs: warmMs.length ? Math.round(median(warmMs)) : null,
-			semiWarmMs: semiWarmMs.map(Math.round),
+			cycles: opts.runs,
+			coldMs: byPhase("cold"),
+			warmMs: byPhase("warm"),
+			semiWarmMs: byPhase("semi-warm"),
 			edits: edits.map(({ file, plugin }) => ({
 				file,
 				plugin
 			})),
 			reset: opts.reset,
 			runs,
-			records: instrument ? node_path.default.relative(ws.root, ws.sessionDir) : null,
+			instrumented: instrument !== null,
 			traces,
 			report,
-			pluginConfigFiles,
+			pluginConfigFiles: "error" in inspection ? inspection : inspection.summary,
 			nxJson: readNxJson(ws.root)
 		};
 		node_fs.default.writeFileSync(node_path.default.join(outDir, "graph-perf.md"), renderMarkdown(result));
 		node_fs.default.writeFileSync(node_path.default.join(outDir, "graph-perf.json"), JSON.stringify(result, null, 2) + "\n");
+		const med = (values) => values.length ? `${Math.round(median(values))}ms` : "n/a";
 		console.log(`wrote ${node_path.default.join(outDir, "graph-perf.md")} and graph-perf.json`);
-		console.log(`projects ${projects.length}, cold ${result.coldGraphMs}ms, warm median ${result.warmMedianMs ?? "n/a"}ms, semi-warm ${semiWarmMs.length ? `${semiWarmMs.map(Math.round).join("/")}ms` : "n/a"}, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`);
+		console.log(`projects ${projects.length}, cycles ${opts.runs}, cold median ${med(result.coldMs)}, warm median ${med(result.warmMs)}, semi-warm median ${med(result.semiWarmMs)}, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`);
 	} finally {
 		for (const edit of edits) edit.restore();
 		withdrawSession(ws);

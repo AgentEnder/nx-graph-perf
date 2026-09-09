@@ -53,42 +53,40 @@ The source is in `src/`. `dist/graph-perf.js` is the same code bundled with its 
 
 ## What it does
 
-1. Runs `nx reset` so the daemon starts fresh.
-2. Replaces `node_modules/nx/dist/src/utils/perf-logging.js` with an instrumented copy that also appends each measure to `.nx/workspace-data/perf-logs/<pid>/<process pid>.jsonl`. The original is backed up and put back when the script exits, including on failure.
-3. Runs `nx show projects --json` once cold (daemon start and full graph construction) and then two more times warm (daemon round trip only).
-4. Runs a series of semi-warm runs. For each loaded plugin whose `createNodes` glob matched files, one of those files is edited; then a source file that no plugin matches. Each edit goes to a project no earlier edit used, appends a newline, waits half a second for the watcher, and runs `nx show projects --json`. Plugin workers restart with their on-disk caches and the daemon rebuilds what the edit touched. Lock files are never edited, since the daemon restarts itself when their hash changes, and neither are the root `package.json` and `nx.json`. Every edited file gets its original bytes back when the script exits, including on failure.
-5. Reads the recorded measures, the data behind `nx report`, and the `plugins`, `targetDefaults` and `namedInputs` blocks of `nx.json`.
-6. Loads the workspace's plugins the way nx does and counts the files each plugin's `createNodes` glob matches.
-7. Writes the report.
+1. Replaces `node_modules/nx/dist/src/utils/perf-logging.js` with an instrumented copy that also appends each measure to a JSON lines file per process under `nx-graph-perf/` in the OS temp directory. The original is backed up and put back when the script exits, including on failure.
+2. Runs `--runs` cycles (three by default). Each cycle is `nx reset`, a cold `nx show projects --json` (daemon start and full graph construction), a warm one (daemon round trip only), and the semi-warm edits.
+3. The semi-warm edits are planned once, in the first cycle, and repeated in every cycle so the cycles compare. For each loaded plugin whose `createNodes` glob matched files, one of those files is edited; then `--source-edits` files that no plugin matches. Each edit goes to a project no earlier edit used, appends a newline, waits half a second for the watcher, and runs `nx show projects --json`. Plugin workers restart with their on-disk caches and the daemon rebuilds what the edit touched. Lock files are never edited, since the daemon restarts itself when their hash changes, and neither are the root `package.json` and `nx.json`. Every edited file gets its original bytes back when the script exits, including on failure.
+4. Reads the recorded measures and deletes them, then reads the data behind `nx report` and the `plugins`, `targetDefaults` and `namedInputs` blocks of `nx.json`.
+5. Writes the report.
 
 The daemon is forced on (`NX_DAEMON=true`) because Nx disables it under CI and inside Docker, and a daemonless run measures something else.
 
 ## Options
 
-| Flag                | Default | Meaning                                                                                                                                                               |
-| ------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--runs N`          | `3`     | Total runs. The first is cold, the rest are warm.                                                                                                                     |
-| `--source-edits N`  | `1`     | Semi-warm runs that edit a plain source file, after the one-per-plugin config edits.                                                                                  |
-| `--edit-file FILE`  |         | Edit this file (relative to the workspace) instead of a random one.                                                                                                   |
-| `--no-edit`         |         | Skip the semi-warm runs.                                                                                                                                              |
-| `--out DIR`         | `.`     | Where to write the report.                                                                                                                                            |
-| `--no-reset`        |         | Skip `nx reset`. The cold run is then whatever the daemon has cached, and a daemon that predates the run cannot be instrumented, so it will not appear in the report. |
-| `--no-instrument`   |         | Only time the commands. No module swap, no per-process measures.                                                                                                      |
-| `--instrument FILE` |         | Use a local instrumented module instead of the bundled one.                                                                                                           |
+| Flag                | Default | Meaning                                                                                                                                                                            |
+| ------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--runs N`          | `3`     | Cycles of reset, cold, warm and the semi-warm edits.                                                                                                                               |
+| `--source-edits N`  | `1`     | Source-file edits per cycle, after the one-per-plugin config edits.                                                                                                                |
+| `--edit-file FILE`  |         | Edit this file (relative to the workspace) instead of a random one.                                                                                                                |
+| `--no-edit`         |         | Skip the semi-warm runs.                                                                                                                                                           |
+| `--out DIR`         | `.`     | Where to write the report.                                                                                                                                                         |
+| `--no-reset`        |         | Skip `nx reset` in every cycle. A cold run is then whatever the daemon has cached, and a daemon that predates the run cannot be instrumented, so it will not appear in the report. |
+| `--no-instrument`   |         | Only time the commands. No module swap, no per-process measures.                                                                                                                   |
+| `--instrument FILE` |         | Use a local instrumented module instead of the bundled one.                                                                                                                        |
 
 ## What the report contains
 
-- Platform, project count, cold, warm and semi-warm wall times.
-- One row per semi-warm run: the edited file, the plugin whose glob matched it, the client wall time, and the daemon's work inside that run.
-- One row per Nx process (client, daemon, each plugin worker labelled with its plugin) with the sum of its top-level measures, cold, per warm run and per semi-warm run. Nested measures count once, so a plugin worker's row is roughly what that plugin cost.
-- Key phases with the cold occurrence beside the warm median and max and the semi-warm median: plugin loading, worker startup, `createNodes`, `createDependencies`, graph serialization, and the client round trip. A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.
+- Platform, project count, and the cold, warm and semi-warm wall times of every cycle with their medians.
+- One row per kind of Nx process (client, daemon, each plugin worker labelled with its plugin) across all cycles, with the sum of its top-level measures per cold, warm and semi-warm run. Nested measures count once, so a plugin worker's row is roughly what that plugin cost.
+- One row per semi-warm edit: the file, the plugin whose glob matched it, how many times it ran, and the median client and daemon time.
+- Key phases with the cold, warm and semi-warm medians and the warm max: plugin loading, worker startup, `createNodes`, `createDependencies`, graph serialization, and the client round trip. A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.
 - Per plugin, the files its `createNodes` glob matches, counted by basename. A config file can produce more than one project, so this bounds a plugin's share rather than counting its projects.
 - The `nx report` data as tables, and the `plugins` and `targetDefaults` blocks of `nx.json`.
-- A Gantt chart for the cold and the warm runs (Mermaid, rendered by GitHub) with one section per process and a bar per top-level measure or key phase.
+- A Gantt chart for the first cycle's cold and warm runs (Mermaid, rendered by GitHub) with one section per process and a bar per top-level measure or key phase.
 
 `graph-perf.json` has everything above plus every recorded measure, tagged with the run it happened in, and the `namedInputs` block.
 
-The raw measures stay in `.nx/workspace-data/perf-logs/` until the next `nx reset`.
+The raw measures are removed after the report is written; `graph-perf.json` carries all of them.
 
 ## Building from source
 

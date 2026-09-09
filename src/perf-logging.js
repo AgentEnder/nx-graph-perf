@@ -4,10 +4,10 @@
 //
 // It keeps the original behaviour (perf lines when NX_PERF_LOGGING=true,
 // analytics for tracked measures) and additionally appends every measure as one
-// JSON line to <workspace-data>/perf-logs/<session>/<pid>.jsonl, where the
-// session name is read from <workspace-data>/perf-logs/ACTIVE. Without that
-// marker the module behaves exactly like the original, so leaving it installed
-// by accident costs nothing.
+// JSON line to <session dir>/<pid>.jsonl, where the session directory is read
+// from a marker file beside this module. Without that marker the module
+// behaves exactly like the original, so leaving it installed by accident costs
+// nothing.
 Object.defineProperty(exports, "__esModule", { value: true });
 const perf_hooks_1 = require("perf_hooks");
 const fs = require("fs");
@@ -18,25 +18,21 @@ function isTrackedDetail(detail) {
 }
 
 let recorder = { session: null, file: null };
-let perfLogsRoot = null;
+// Written by graph-perf.js next to this module; holds the session directory.
+const marker = path.join(__dirname, 'perf-logging.js.graph-perf-session');
 
 // Re-reads the marker on every batch: a long-lived daemon outlives the session
 // that started it, and its measures must land with whichever session is active
 // now, or nowhere when none is.
 function getRecorder() {
     try {
-        if (!perfLogsRoot) {
-            const { workspaceDataDirectory } = require('./cache-directory');
-            perfLogsRoot = path.join(workspaceDataDirectory, 'perf-logs');
-        }
-        const marker = path.join(perfLogsRoot, 'ACTIVE');
         const session = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').trim() : '';
         if (!session) {
             recorder = { session: null, file: null };
             return recorder;
         }
         if (recorder.session === session) return recorder;
-        const dir = path.join(perfLogsRoot, session);
+        const dir = session;
         fs.mkdirSync(dir, { recursive: true });
         const file = path.join(dir, `${process.pid}.jsonl`);
         // Header line, so the file says which process it belongs to.
