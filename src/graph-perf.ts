@@ -61,7 +61,20 @@ type MeasureRecord = {
   startTime: number;
   duration: number;
   detail: unknown;
+  /** Which timed command was in flight when the measure started. */
+  phase: Phase;
+  run: number;
 };
+
+type Phase = 'cold' | 'warm';
+
+interface Run {
+  index: number;
+  phase: Phase;
+  startedAt: number;
+  endedAt: number;
+  wallMs: number;
+}
 
 type ProcessTrace = {
   pid: number;
@@ -103,6 +116,8 @@ interface CommandResult {
   status: number;
   stdout: string;
   stderr: string;
+  startedAt: number;
+  endedAt: number;
   wallMs: number;
 }
 
@@ -186,6 +201,7 @@ function resolveNxInternal(ws: Workspace, rel: string): string | null {
 
 /** Runs `nx <args>` and returns exit code, output and wall time. */
 function nx(ws: Workspace, args: string[]): CommandResult {
+  const startedAt = Date.now();
   const started = process.hrtime.bigint();
   const common = { cwd: ws.root, env: ws.env, encoding: 'utf8' as const, maxBuffer: 64 * 1024 * 1024 };
   const result = ws.nxBin
@@ -200,6 +216,8 @@ function nx(ws: Workspace, args: string[]): CommandResult {
     status: result.status ?? -1,
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? '',
+    startedAt,
+    endedAt: Date.now(),
     wallMs,
   };
 }
@@ -352,24 +370,32 @@ function withdrawSession(ws: Workspace): void {
   fs.rmSync(path.join(ws.perfLogsRoot, 'ACTIVE'), { force: true });
 }
 
-function readTraces(ws: Workspace): ProcessTrace[] {
+function readTraces(ws: Workspace, runs: Run[]): ProcessTrace[] {
   if (!fs.existsSync(ws.sessionDir)) return [];
   const traces: ProcessTrace[] = [];
   for (const file of fs.readdirSync(ws.sessionDir)) {
     if (!file.endsWith('.jsonl')) continue;
     let header: ProcessRecord | null = null;
-    const measures: MeasureRecord[] = [];
+    const raw: Omit<MeasureRecord, 'phase' | 'run'>[] = [];
     for (const line of fs.readFileSync(path.join(ws.sessionDir, file), 'utf8').split('\n')) {
       if (!line.trim()) continue;
       try {
         const record = JSON.parse(line);
         if (record.kind === 'process') header = record;
-        else if (record.kind === 'measure') measures.push(record);
+        else if (record.kind === 'measure') raw.push(record);
       } catch {
         // A line torn by a process dying mid-write is dropped, not fatal.
       }
     }
     if (!header) continue;
+    const timeOrigin = header.timeOrigin;
+    // A measure belongs to the timed command that had started most recently
+    // when it began; process time origins and run timestamps share the epoch.
+    const measures: MeasureRecord[] = raw.map((m) => {
+      const at = timeOrigin + m.startTime;
+      const run = runs.reduce((current, r) => (r.startedAt <= at ? r : current), runs[0]);
+      return { ...m, phase: run.phase, run: run.index };
+    });
     measures.sort((a, b) => a.startTime - b.startTime);
     traces.push({
       pid: header.pid,
@@ -428,15 +454,42 @@ const ms = (n: number) => `${n.toFixed(1)} ms`;
 
 const cell = (s: string) => s.replace(/\|/g, '\\|').replace(/\n/g, ' ');
 
+const rootForms = new Map<string, string[]>();
+
+/** The workspace root as given and as its realpath, since nx reports the latter. */
+function rootPrefixes(root: string): string[] {
+  let forms = rootForms.get(root);
+  if (!forms) {
+    forms = [root];
+    try {
+      const real = fs.realpathSync(root);
+      if (real !== root) forms.push(real);
+    } catch {
+      // unresolvable root: the plain form is all there is
+    }
+    rootForms.set(root, forms);
+  }
+  return forms;
+}
+
 /** Shortens the workspace-rooted plugin paths nx puts in measure names. */
 function shortName(root: string, name: string): string {
-  return name
-    .split(root + path.sep)
-    .join('')
-    .split(root + '/')
-    .join('')
-    .replace(/node_modules[\\/]nx[\\/]dist[\\/]src[\\/]plugins[\\/]/g, 'nx:')
-    .replace(/node_modules[\\/]/g, '');
+  let short = name;
+  for (const prefix of rootPrefixes(root)) {
+    for (const sep of [path.sep, '/']) {
+      if (short.startsWith(prefix + sep)) short = short.slice(prefix.length + sep.length);
+    }
+  }
+  return (
+    short
+      // pnpm: node_modules/.pnpm/<pkg>@<version>_<hash>/node_modules/<pkg>
+      .replace(/node_modules[\\/]\.pnpm[\\/][^\\/]+[\\/]node_modules[\\/]/g, 'node_modules/')
+      // a package resolved from above the workspace keeps its absolute prefix;
+      // the path token runs from the start or a label separator to node_modules
+      .replace(/(^|[\s:])(?:\S*[\\/])?node_modules[\\/]/, '$1node_modules/')
+      .replace(/node_modules[\\/]nx[\\/]dist[\\/]src[\\/]plugins[\\/]/g, 'nx:')
+      .replace(/node_modules[\\/]/g, '')
+  );
 }
 
 const KEY_PHASES = [
@@ -464,6 +517,7 @@ interface Collected {
   coldGraphMs: number;
   warmMs: number[];
   warmMedianMs: number | null;
+  runs: Run[];
   records: string | null;
   traces: ProcessTrace[];
   report: ReportData;
@@ -484,17 +538,18 @@ function renderMarkdown(r: Collected): string {
   if (r.traces.length === 0) {
     sections.push('No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.');
   } else {
+    const warmRuns = r.runs.filter((run) => run.phase === 'warm').length;
     sections.push(
       md.h2(
         'Processes',
-        renderProcesses(r.traces),
-        'The top-level sum adds up the measures of a process that are not fully inside another of its measures, so nested phases count once. For a plugin worker that is roughly what the plugin cost.',
+        renderProcesses(r.traces, warmRuns),
+        `Sums add up the measures of a process that are not fully inside another of its measures, so nested phases count once; for a plugin worker that is roughly what the plugin cost. A measure is cold or warm by which timed command was in flight when it started. Warm is per run, over ${warmRuns} warm run${warmRuns === 1 ? '' : 's'}.`,
       ),
     );
     sections.push(
       md.h2(
         'Key phases',
-        'Every occurrence across all processes, so cold and warm runs both show.',
+        'Cold is the occurrence during the first graph construction; warm covers every later run. A phase that is slow warm costs every command, not just the first.',
         renderKeyPhases(r.workspaceRoot, r.traces),
       ),
     );
@@ -508,6 +563,7 @@ function renderMarkdown(r: Collected): string {
             md.table(t.measures, [
               { label: 'start', mapFn: (m) => `+${ms(m.startTime)}` },
               { label: 'duration', mapFn: (m) => ms(m.duration) },
+              { label: 'run', mapFn: (m) => (m.phase === 'cold' ? 'cold' : `warm ${m.run}`) },
               { label: 'measure', mapFn: (m) => cell(shortName(r.workspaceRoot, m.name)) },
             ]),
           ),
@@ -535,15 +591,22 @@ function renderMarkdown(r: Collected): string {
   return md.h1('Nx graph construction', summary, ...sections) + '\n';
 }
 
-function renderProcesses(traces: ProcessTrace[]): string {
+function renderProcesses(traces: ProcessTrace[], warmRuns: number): string {
   const earliest = Math.min(...traces.map((t) => t.timeOrigin));
+  const phaseSum = (t: ProcessTrace, phase: Phase) => {
+    const subset = t.measures.filter((m) => m.phase === phase);
+    if (!subset.length) return '-';
+    const sum = topLevelMs(subset);
+    return ms(phase === 'warm' && warmRuns ? sum / warmRuns : sum);
+  };
   return md.table(traces, [
     { label: 'pid', field: 'pid' },
     { label: 'role', mapFn: (t) => cell(t.role) },
     { label: 'parent', field: 'ppid' },
     { label: 'started at', mapFn: (t) => `+${ms(t.timeOrigin - earliest)}` },
     { label: 'measures', mapFn: (t) => t.measures.length },
-    { label: 'top-level sum', mapFn: (t) => ms(topLevelMs(t.measures)) },
+    { label: 'cold sum', mapFn: (t) => phaseSum(t, 'cold') },
+    { label: 'warm sum / run', mapFn: (t) => phaseSum(t, 'warm') },
     {
       label: 'last measure ends',
       mapFn: (t) =>
@@ -553,25 +616,28 @@ function renderProcesses(traces: ProcessTrace[]): string {
 }
 
 function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
-  const byPhase = new Map<string, { phase: string; process: string; durations: number[] }>();
+  type Row = { phase: string; process: string; cold: number[]; warm: number[] };
+  const byPhase = new Map<string, Row>();
   for (const t of traces) {
     for (const m of t.measures) {
       if (!KEY_PHASES.some((p) => p.test(m.name))) continue;
       const phase = shortName(root, m.name);
       const key = `${phase} ${roleKind(t.role)}`;
-      const entry = byPhase.get(key) ?? { phase, process: roleKind(t.role), durations: [] };
-      entry.durations.push(m.duration);
+      const entry = byPhase.get(key) ?? { phase, process: roleKind(t.role), cold: [], warm: [] };
+      entry[m.phase].push(m.duration);
       byPhase.set(key, entry);
     }
   }
-  const phases = [...byPhase.values()].sort((a, b) => Math.max(...b.durations) - Math.max(...a.durations));
-  return md.table(phases, [
+  const worst = (row: Row) => Math.max(...row.cold, ...row.warm);
+  const rows = [...byPhase.values()].sort((a, b) => worst(b) - worst(a));
+  const stat = (values: number[], pick: (v: number[]) => number) => (values.length ? ms(pick(values)) : '-');
+  return md.table(rows, [
     { label: 'phase', mapFn: (p) => cell(p.phase) },
     { label: 'process', field: 'process' },
-    { label: 'occurrences', mapFn: (p) => p.durations.length },
-    { label: 'first', mapFn: (p) => ms(p.durations[0]) },
-    { label: 'median', mapFn: (p) => ms(median(p.durations)) },
-    { label: 'max', mapFn: (p) => ms(Math.max(...p.durations)) },
+    { label: 'cold', mapFn: (p) => stat(p.cold, (v) => Math.max(...v)) },
+    { label: 'warm median', mapFn: (p) => stat(p.warm, median) },
+    { label: 'warm max', mapFn: (p) => stat(p.warm, (v) => Math.max(...v)) },
+    { label: 'warm runs', mapFn: (p) => p.warm.length },
   ]);
 }
 
@@ -719,17 +785,20 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
 
     // Subsequent runs hit the daemon's cached graph; their wall time is the
     // client round trip, which is what a developer feels on every command.
-    const warmMs: number[] = [];
+    const runs: Run[] = [
+      { index: 0, phase: 'cold', startedAt: cold.startedAt, endedAt: cold.endedAt, wallMs: cold.wallMs },
+    ];
     for (let i = 1; i < opts.runs; i++) {
       console.log(`warm run ${i} of ${opts.runs - 1}`);
       const warm = nx(ws, ['show', 'projects', '--json']);
       assertOk('nx show projects (warm)', warm);
-      warmMs.push(warm.wallMs);
+      runs.push({ index: i, phase: 'warm', startedAt: warm.startedAt, endedAt: warm.endedAt, wallMs: warm.wallMs });
     }
+    const warmMs = runs.filter((run) => run.phase === 'warm').map((run) => run.wallMs);
 
     // Stop recording before anything that is not graph construction runs.
     withdrawSession(ws);
-    const traces = instrument ? readTraces(ws) : [];
+    const traces = instrument ? readTraces(ws, runs) : [];
 
     console.log('nx report data');
     const report = await readReportData(ws);
@@ -752,6 +821,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
       coldGraphMs: Math.round(cold.wallMs),
       warmMs: warmMs.map(Math.round),
       warmMedianMs: warmMs.length ? Math.round(median(warmMs)) : null,
+      runs,
       records: instrument ? path.relative(ws.root, ws.sessionDir) : null,
       traces,
       report,
