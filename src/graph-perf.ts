@@ -349,11 +349,13 @@ async function readPluginConfigFiles(ws: Workspace): Promise<PluginInspection | 
     return { error: 'nx plugin loading internals not found in this nx version' };
   }
   try {
-    const { getPlugins: loadPlugins, cleanupPlugins } = ws.require(getPlugins);
+    const { getPlugins: loadPlugins } = ws.require(getPlugins);
     const { globWithWorkspaceContextSync } = ws.require(workspaceContext);
     const { readNxJson } = ws.require(nxJsonModule);
     const { findMatchingConfigFiles } = ws.require(configUtils);
-    const plugins: LoadedPlugin[] = await loadPlugins(readNxJson(root), root);
+    // Nx 23 takes the nx.json first; earlier versions take only the root.
+    const plugins: LoadedPlugin[] =
+      loadPlugins.length >= 1 ? await loadPlugins(readNxJson(root), root) : await loadPlugins(root);
     const result: PluginConfigFiles[] = [];
     const matchedByPlugin = new Map<string, string[]>();
     const entries = new Map<string, (number | null)[]>();
@@ -362,7 +364,11 @@ async function readPluginConfigFiles(ws: Workspace): Promise<PluginInspection | 
       if (!plugin.createNodes) continue;
       const pattern = plugin.createNodes[0];
       const candidates: string[] = globWithWorkspaceContextSync(root, [pattern]);
-      const matched: string[] = findMatchingConfigFiles(candidates, plugin.include, plugin.exclude);
+      // Nx 20 to 22 take the pattern as well; 23 dropped it.
+      const matched: string[] =
+        findMatchingConfigFiles.length >= 4
+          ? findMatchingConfigFiles(candidates, pattern, plugin.include, plugin.exclude)
+          : findMatchingConfigFiles(candidates, plugin.include, plugin.exclude);
       matchedByPlugin.set(plugin.name, [...(matchedByPlugin.get(plugin.name) ?? []), ...matched]);
       const counts = new Map<string, number>();
       for (const file of matched) {
@@ -381,10 +387,23 @@ async function readPluginConfigFiles(ws: Workspace): Promise<PluginInspection | 
           .sort((a, b) => b.count - a.count || a.file.localeCompare(b.file)),
       });
     }
-    cleanupPlugins?.();
+    // The loaded plugins stay cached for the report data; releasePlugins()
+    // runs once at the end. Nx 20 leaves the cache pointing at torn-down
+    // workers after a cleanup, and the next load then waits forever.
     return { summary: result, matched: matchedByPlugin, entries };
   } catch (e) {
     return { error: `plugin inspection failed: ${errorMessage(e)}` };
+  }
+}
+
+/** Shuts down the plugin workers this process loaded for its own lookups. */
+function releasePlugins(ws: Workspace): void {
+  const getPlugins = resolveNxInternal(ws, 'project-graph/plugins/get-plugins');
+  if (!getPlugins) return;
+  try {
+    ws.require(getPlugins).cleanupPlugins?.();
+  } catch {
+    // Best effort; the process exits right after.
   }
 }
 
@@ -482,16 +501,12 @@ interface Instrument {
   restore(): void;
 }
 
-function installInstrument(ws: Workspace, source: string): Instrument | null {
-  const target = ws.perfLogging;
-  if (!target) {
-    console.warn('could not locate nx perf-logging module; running without instrumentation');
-    return null;
-  }
+/** Replaces a file for the session, keeping the original beside it. */
+function swapFile(target: string, content: string): () => void {
   const backup = `${target}.graph-perf-backup`;
   // A backup left by an interrupted run is the real original; keep it.
   if (!fs.existsSync(backup)) fs.copyFileSync(target, backup);
-  fs.writeFileSync(target, source);
+  fs.writeFileSync(target, content);
   let restored = false;
   const restore = () => {
     if (restored) return;
@@ -500,7 +515,41 @@ function installInstrument(ws: Workspace, source: string): Instrument | null {
     fs.rmSync(backup, { force: true });
   };
   process.on('exit', restore);
-  return { restore, target };
+  return restore;
+}
+
+function installInstrument(ws: Workspace, source: string): Instrument | null {
+  const target = ws.perfLogging;
+  if (!target) {
+    console.warn('could not locate nx perf-logging module; running without instrumentation');
+    return null;
+  }
+  const restores = [swapFile(target, source)];
+  // Not every Nx version loads perf-logging in every process: before 22 the
+  // daemon never does, and 22's client does not. Where an entry point (or the
+  // module it delegates to) lacks the require, one is prepended so the
+  // process still records; on versions that already load it this is a no-op.
+  const hook = (entry: string) => {
+    const relative = path.relative(path.dirname(entry), target).split(path.sep).join('/');
+    const original = fs.readFileSync(entry, 'utf8');
+    const line = `require(${JSON.stringify(relative.startsWith('.') ? relative : `./${relative}`)});`;
+    const patched = original.startsWith('#!')
+      ? original.replace(/^(#![^\n]*\n)/, `$1${line}\n`)
+      : `${line}\n${original}`;
+    restores.push(swapFile(entry, patched));
+  };
+  const loads = (file: string | null) => file !== null && fs.readFileSync(file, 'utf8').includes('perf-logging');
+  const server = resolveNxInternal(ws, 'daemon/server/server.js');
+  const start = resolveNxInternal(ws, 'daemon/server/start.js');
+  if (start && !loads(server) && !loads(start)) hook(start);
+  const client = resolveFromWorkspace(ws.require, 'nx/bin/nx.js');
+  if (client && !loads(client)) hook(client);
+  return {
+    target,
+    restore: () => {
+      for (const restore of restores) restore();
+    },
+  };
 }
 
 const markerFor = (ws: Workspace) => (ws.perfLogging ? `${ws.perfLogging}.graph-perf-session` : null);
@@ -565,6 +614,10 @@ function readTraces(ws: Workspace, runs: Run[], entries: Map<string, (number | n
       }
     }
     if (!header) continue;
+    const role = classify(ws.root, header);
+    // Workers this process spawned while inspecting plugins are not part of
+    // the measured runs; the clients it spawned are.
+    if (roleKind(role) === 'plugin worker' && header.ppid === process.pid) continue;
     const timeOrigin = header.timeOrigin;
     // A measure belongs to the latest run started before it. It is cold only
     // while that cold command is still running; anything after the command
@@ -580,7 +633,7 @@ function readTraces(ws: Workspace, runs: Run[], entries: Map<string, (number | n
     traces.push({
       pid: header.pid,
       ppid: header.ppid,
-      role: classify(ws.root, header),
+      role,
       argv: header.argv,
       timeOrigin: header.timeOrigin,
       measures,
@@ -1001,6 +1054,11 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
   const outDir = path.resolve(ws.root, opts.out);
   fs.mkdirSync(outDir, { recursive: true });
 
+  // Restores hang off the exit event, which a signal would skip.
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(signal, () => process.exit(signal === 'SIGINT' ? 130 : 143));
+  }
+
   let instrument: Instrument | null = null;
   if (opts.instrument) {
     const source = opts.instrumentFile
@@ -1100,6 +1158,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
 
     console.log('nx report data');
     const report = await readReportData(ws);
+    releasePlugins(ws);
     const byPhase = (phase: Phase) => runs.filter((run) => run.phase === phase).map((run) => Math.round(run.wallMs));
 
     const result: Collected = {

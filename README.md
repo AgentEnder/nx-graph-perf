@@ -6,7 +6,7 @@ It records every performance measure from every Nx process involved (the CLI cli
 
 ## Run it
 
-Requires Node 18 or newer. Run from the workspace root, where `nx.json` lives.
+Requires Node 18 or newer and works with Nx 20 and later. Run from the workspace root, where `nx.json` lives.
 
 macOS and Linux, with curl:
 
@@ -53,7 +53,7 @@ The source is in `src/`. `dist/graph-perf.js` is the same code bundled with its 
 
 ## What it does
 
-1. Replaces `node_modules/nx/dist/src/utils/perf-logging.js` with an instrumented copy that also appends each measure to a JSON lines file per process under `nx-graph-perf/` in the OS temp directory. The original is backed up and put back when the script exits, including on failure.
+1. Replaces nx's `perf-logging.js` module with a copy that loads the original and also appends each measure to a JSON lines file per process under `nx-graph-perf/` in the OS temp directory. On versions where the daemon or the client does not load that module (the daemon before Nx 22, the client on Nx 22), one `require` line is added to that entry point. Every touched file is backed up and put back when the script exits, on failure and on Ctrl-C alike.
 2. Runs `--runs` cycles (three by default). Each cycle is `nx reset`, a cold `nx show projects --json` (daemon start and full graph construction), a warm one (daemon round trip only), and the semi-warm edits.
 3. The semi-warm edits are planned once, in the first cycle, and repeated in every cycle so the cycles compare. For each loaded plugin whose `createNodes` glob matched files, one of those files is edited; then `--source-edits` files that no plugin matches. Each edit goes to a project no earlier edit used, appends a newline, waits half a second for the watcher, and runs `nx show projects --json`. Plugin workers restart with their on-disk caches and the daemon rebuilds what the edit touched. Lock files are never edited, since the daemon restarts itself when their hash changes, and neither are the root `package.json` and `nx.json`. Every edited file gets its original bytes back when the script exits, including on failure.
 4. Reads the recorded measures and deletes them, then reads the data behind `nx report` and the `plugins`, `targetDefaults` and `namedInputs` blocks of `nx.json`.

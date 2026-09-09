@@ -241,7 +241,7 @@ function assert(check, message, allowByPass = true) {
 //#endregion
 //#region src/instrument.ts
 function instrumentSource() {
-	return "\"use strict\";\n// Drop-in replacement for nx/dist/src/utils/perf-logging.js, installed by\n// graph-perf.js for the duration of a measurement and restored afterwards.\n//\n// It keeps the original behaviour (perf lines when NX_PERF_LOGGING=true,\n// analytics for tracked measures) and additionally appends every measure as one\n// JSON line to <session dir>/<pid>.jsonl, where the session directory is read\n// from a marker file beside this module. Without that marker the module\n// behaves exactly like the original, so leaving it installed by accident costs\n// nothing.\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst perf_hooks_1 = require(\"perf_hooks\");\nconst fs = require(\"fs\");\nconst path = require(\"path\");\n\nfunction isTrackedDetail(detail) {\n  return typeof detail === \"object\" && detail !== null && detail.track === true;\n}\n\nlet recorder = { session: null, file: null };\n// Written by graph-perf.js next to this module; holds the session directory.\nconst marker = path.join(__dirname, 'perf-logging.js.graph-perf-session');\n\n// Re-reads the marker on every batch: a long-lived daemon outlives the session\n// that started it, and its measures must land with whichever session is active\n// now, or nowhere when none is.\nfunction getRecorder() {\n    try {\n        const session = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').trim() : '';\n        if (!session) {\n            recorder = { session: null, file: null };\n            return recorder;\n        }\n        if (recorder.session === session) return recorder;\n        const dir = session;\n        fs.mkdirSync(dir, { recursive: true });\n        const file = path.join(dir, `${process.pid}.jsonl`);\n        // Header line, so the file says which process it belongs to.\n        fs.appendFileSync(file, JSON.stringify({\n            kind: 'process',\n            pid: process.pid,\n            ppid: process.ppid,\n            argv: process.argv,\n            execArgv: process.execArgv,\n            cwd: process.cwd(),\n            node: process.version,\n            timeOrigin: perf_hooks_1.performance.timeOrigin,\n        }) + '\\n');\n        recorder = { session, file };\n    } catch {\n        recorder = { session: null, file: null };\n    }\n    return recorder;\n}\n\nfunction safeDetail(detail) {\n  if (detail === undefined || detail === null) return null;\n  try {\n    return JSON.parse(JSON.stringify(detail));\n  } catch {\n    return String(detail);\n  }\n}\n\nnew perf_hooks_1.PerformanceObserver((list) => {\n  // observer is configured for 'measure' entries only (see .observe call below)\n  const entries = list.getEntries();\n  const rec = getRecorder();\n  if (rec.file) {\n    let lines = \"\";\n    for (const entry of entries) {\n      lines +=\n        JSON.stringify({\n          kind: \"measure\",\n          pid: process.pid,\n          name: entry.name,\n          startTime: entry.startTime,\n          duration: entry.duration,\n          detail: safeDetail(entry.detail),\n        }) + \"\\n\";\n    }\n    try {\n      fs.appendFileSync(rec.file, lines);\n    } catch {\n      // Recording is best effort; never break the process being measured.\n    }\n  }\n  const logEnabled = process.env.NX_PERF_LOGGING === \"true\";\n  const tracked = entries.filter((e) => isTrackedDetail(e.detail));\n  // Short-circuit before loading analytics / daemon logger (~60ms of native\n  // binding + module init) when there's nothing to do.\n  if (!logEnabled && tracked.length === 0) return;\n  if (logEnabled) {\n    const { isOnDaemon } = require(\"../daemon/is-on-daemon\");\n    const { serverLogger } = require(\"../daemon/logger\");\n    const { logger } = require(\"./logger\");\n    const log = isOnDaemon() ? (msg) => serverLogger.log(msg) : (msg) => logger.warn(msg);\n    for (const entry of entries) {\n      log(`Time taken for '${entry.name}' ${entry.duration}ms`);\n    }\n  }\n  if (tracked.length === 0) return;\n  const { customDimensions, reportEvent } = require(\"../analytics\");\n  if (!customDimensions) return;\n  const dimensionValues = new Set(Object.values(customDimensions));\n  for (const entry of tracked) {\n    const { track, ...rest } = entry.detail;\n    const params = {\n      [customDimensions.duration]: entry.duration,\n    };\n    for (const [key, value] of Object.entries(rest)) {\n      if (dimensionValues.has(key)) params[key] = value;\n    }\n    reportEvent(entry.name, params);\n  }\n}).observe({ entryTypes: [\"measure\"] });\n";
+	return "\"use strict\";\n// Drop-in replacement for nx's perf-logging.js, installed by graph-perf.js for\n// the duration of a measurement and restored afterwards.\n//\n// The original module is kept beside this one as perf-logging.js.graph-perf-backup\n// and loaded first, so whatever this nx version does with measures (perf log\n// lines, analytics) keeps happening. This module only adds a second observer\n// that appends every measure as one JSON line to <session dir>/<pid>.jsonl,\n// where the session directory is read from a marker file beside this module.\n// Without that marker the observer does nothing.\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst perf_hooks_1 = require(\"perf_hooks\");\nconst fs = require(\"fs\");\nconst path = require(\"path\");\n\ntry {\n    require(\"./perf-logging.js.graph-perf-backup\");\n} catch {\n    // No original to delegate to; recording still works.\n}\n\nlet recorder = { session: null, file: null };\n// Written by graph-perf.js next to this module; holds the session directory.\nconst marker = path.join(__dirname, 'perf-logging.js.graph-perf-session');\n\n// Re-reads the marker on every batch: a long-lived daemon outlives the session\n// that started it, and its measures must land with whichever session is active\n// now, or nowhere when none is.\nfunction getRecorder() {\n    try {\n        const session = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').trim() : '';\n        if (!session) {\n            recorder = { session: null, file: null };\n            return recorder;\n        }\n        if (recorder.session === session) return recorder;\n        const dir = session;\n        fs.mkdirSync(dir, { recursive: true });\n        const file = path.join(dir, `${process.pid}.jsonl`);\n        // Header line, so the file says which process it belongs to.\n        fs.appendFileSync(file, JSON.stringify({\n            kind: 'process',\n            pid: process.pid,\n            ppid: process.ppid,\n            argv: process.argv,\n            execArgv: process.execArgv,\n            cwd: process.cwd(),\n            node: process.version,\n            timeOrigin: perf_hooks_1.performance.timeOrigin,\n        }) + '\\n');\n        recorder = { session, file };\n    } catch {\n        recorder = { session: null, file: null };\n    }\n    return recorder;\n}\n\nfunction safeDetail(detail) {\n    if (detail === undefined || detail === null) return null;\n    try {\n        return JSON.parse(JSON.stringify(detail));\n    } catch {\n        return String(detail);\n    }\n}\n\nnew perf_hooks_1.PerformanceObserver((list) => {\n    const rec = getRecorder();\n    if (!rec.file) return;\n    let lines = '';\n    for (const entry of list.getEntries()) {\n        lines += JSON.stringify({\n            kind: 'measure',\n            pid: process.pid,\n            name: entry.name,\n            startTime: entry.startTime,\n            duration: entry.duration,\n            detail: safeDetail(entry.detail),\n        }) + '\\n';\n    }\n    try {\n        fs.appendFileSync(rec.file, lines);\n    } catch {\n        // Recording is best effort; never break the process being measured.\n    }\n}).observe({ entryTypes: ['measure'] });\n";
 }
 
 //#endregion
@@ -417,11 +417,11 @@ async function readPluginConfigFiles(ws) {
 	const configUtils = resolveNxInternal(ws, "project-graph/utils/project-configuration-utils");
 	if (!getPlugins || !workspaceContext || !nxJsonModule || !configUtils) return { error: "nx plugin loading internals not found in this nx version" };
 	try {
-		const { getPlugins: loadPlugins, cleanupPlugins } = ws.require(getPlugins);
+		const { getPlugins: loadPlugins } = ws.require(getPlugins);
 		const { globWithWorkspaceContextSync } = ws.require(workspaceContext);
 		const { readNxJson } = ws.require(nxJsonModule);
 		const { findMatchingConfigFiles } = ws.require(configUtils);
-		const plugins = await loadPlugins(readNxJson(root), root);
+		const plugins = loadPlugins.length >= 1 ? await loadPlugins(readNxJson(root), root) : await loadPlugins(root);
 		const result = [];
 		const matchedByPlugin = /* @__PURE__ */ new Map();
 		const entries = /* @__PURE__ */ new Map();
@@ -429,7 +429,8 @@ async function readPluginConfigFiles(ws) {
 			entries.set(plugin.name, [...entries.get(plugin.name) ?? [], plugin.index ?? null]);
 			if (!plugin.createNodes) continue;
 			const pattern = plugin.createNodes[0];
-			const matched = findMatchingConfigFiles(globWithWorkspaceContextSync(root, [pattern]), plugin.include, plugin.exclude);
+			const candidates = globWithWorkspaceContextSync(root, [pattern]);
+			const matched = findMatchingConfigFiles.length >= 4 ? findMatchingConfigFiles(candidates, pattern, plugin.include, plugin.exclude) : findMatchingConfigFiles(candidates, plugin.include, plugin.exclude);
 			matchedByPlugin.set(plugin.name, [...matchedByPlugin.get(plugin.name) ?? [], ...matched]);
 			const counts = /* @__PURE__ */ new Map();
 			for (const file of matched) {
@@ -449,7 +450,6 @@ async function readPluginConfigFiles(ws) {
 				})).sort((a, b) => b.count - a.count || a.file.localeCompare(b.file))
 			});
 		}
-		cleanupPlugins?.();
 		return {
 			summary: result,
 			matched: matchedByPlugin,
@@ -458,6 +458,14 @@ async function readPluginConfigFiles(ws) {
 	} catch (e) {
 		return { error: `plugin inspection failed: ${errorMessage(e)}` };
 	}
+}
+/** Shuts down the plugin workers this process loaded for its own lookups. */
+function releasePlugins(ws) {
+	const getPlugins = resolveNxInternal(ws, "project-graph/plugins/get-plugins");
+	if (!getPlugins) return;
+	try {
+		ws.require(getPlugins).cleanupPlugins?.();
+	} catch {}
 }
 const LOCK_FILES = /* @__PURE__ */ new Set([
 	"package-lock.json",
@@ -540,15 +548,11 @@ function installEdit(ws, plan) {
 	};
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-function installInstrument(ws, source) {
-	const target = ws.perfLogging;
-	if (!target) {
-		console.warn("could not locate nx perf-logging module; running without instrumentation");
-		return null;
-	}
+/** Replaces a file for the session, keeping the original beside it. */
+function swapFile(target, content) {
 	const backup = `${target}.graph-perf-backup`;
 	if (!node_fs.default.existsSync(backup)) node_fs.default.copyFileSync(target, backup);
-	node_fs.default.writeFileSync(target, source);
+	node_fs.default.writeFileSync(target, content);
 	let restored = false;
 	const restore = () => {
 		if (restored) return;
@@ -557,9 +561,33 @@ function installInstrument(ws, source) {
 		node_fs.default.rmSync(backup, { force: true });
 	};
 	process.on("exit", restore);
+	return restore;
+}
+function installInstrument(ws, source) {
+	const target = ws.perfLogging;
+	if (!target) {
+		console.warn("could not locate nx perf-logging module; running without instrumentation");
+		return null;
+	}
+	const restores = [swapFile(target, source)];
+	const hook = (entry) => {
+		const relative = node_path.default.relative(node_path.default.dirname(entry), target).split(node_path.default.sep).join("/");
+		const original = node_fs.default.readFileSync(entry, "utf8");
+		const line = `require(${JSON.stringify(relative.startsWith(".") ? relative : `./${relative}`)});`;
+		const patched = original.startsWith("#!") ? original.replace(/^(#![^\n]*\n)/, `$1${line}\n`) : `${line}\n${original}`;
+		restores.push(swapFile(entry, patched));
+	};
+	const loads = (file) => file !== null && node_fs.default.readFileSync(file, "utf8").includes("perf-logging");
+	const server = resolveNxInternal(ws, "daemon/server/server.js");
+	const start = resolveNxInternal(ws, "daemon/server/start.js");
+	if (start && !loads(server) && !loads(start)) hook(start);
+	const client = resolveFromWorkspace(ws.require, "nx/bin/nx.js");
+	if (client && !loads(client)) hook(client);
 	return {
-		restore,
-		target
+		target,
+		restore: () => {
+			for (const restore of restores) restore();
+		}
 	};
 }
 const markerFor = (ws) => ws.perfLogging ? `${ws.perfLogging}.graph-perf-session` : null;
@@ -618,6 +646,8 @@ function readTraces(ws, runs, entries) {
 			} catch {}
 		}
 		if (!header) continue;
+		const role = classify(ws.root, header);
+		if (roleKind(role) === "plugin worker" && header.ppid === process.pid) continue;
 		const timeOrigin = header.timeOrigin;
 		const measures = raw.map((m) => {
 			const at = timeOrigin + m.startTime;
@@ -633,7 +663,7 @@ function readTraces(ws, runs, entries) {
 		traces.push({
 			pid: header.pid,
 			ppid: header.ppid,
-			role: classify(ws.root, header),
+			role,
 			argv: header.argv,
 			timeOrigin: header.timeOrigin,
 			measures
@@ -990,6 +1020,7 @@ async function run(argv, workspaceRoot) {
 	const startedAt = (/* @__PURE__ */ new Date()).toISOString();
 	const outDir = node_path.default.resolve(ws.root, opts.out);
 	node_fs.default.mkdirSync(outDir, { recursive: true });
+	for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => process.exit(signal === "SIGINT" ? 130 : 143));
 	let instrument = null;
 	if (opts.instrument) {
 		const source = opts.instrumentFile ? node_fs.default.readFileSync(node_path.default.resolve(opts.instrumentFile), "utf8") : instrumentSource();
@@ -1079,6 +1110,7 @@ async function run(argv, workspaceRoot) {
 		}
 		console.log("nx report data");
 		const report = await readReportData(ws);
+		releasePlugins(ws);
 		const byPhase = (phase) => runs.filter((run) => run.phase === phase).map((run) => Math.round(run.wallMs));
 		const result = {
 			collectedAt: startedAt,
