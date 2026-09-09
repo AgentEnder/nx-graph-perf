@@ -281,7 +281,8 @@ const INJECTED_BY_NX = /* @__PURE__ */ new Set(["NX_ANALYTICS_SESSION_ID", "NX_U
 function parseArgs(argv) {
 	const opts = {
 		runs: 3,
-		edits: 1,
+		edit: true,
+		sourceEdits: 1,
 		editFile: null,
 		out: ".",
 		reset: true,
@@ -291,15 +292,15 @@ function parseArgs(argv) {
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "--runs") opts.runs = Math.max(1, Number(argv[++i]));
-		else if (arg === "--edits") opts.edits = Math.max(0, Number(argv[++i]));
+		else if (arg === "--source-edits") opts.sourceEdits = Math.max(0, Number(argv[++i]));
 		else if (arg === "--edit-file") opts.editFile = argv[++i];
-		else if (arg === "--no-edit") opts.edits = 0;
+		else if (arg === "--no-edit") opts.edit = false;
 		else if (arg === "--out") opts.out = argv[++i];
 		else if (arg === "--no-reset") opts.reset = false;
 		else if (arg === "--no-instrument") opts.instrument = false;
 		else if (arg === "--instrument") opts.instrumentFile = argv[++i];
 		else if (arg === "--help" || arg === "-h") {
-			console.log("usage: node graph-perf.js [--runs N] [--edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]");
+			console.log("usage: node graph-perf.js [--runs N] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]");
 			process.exit(0);
 		} else {
 			console.error(`unknown argument: ${arg}`);
@@ -410,12 +411,6 @@ async function readReportData(ws) {
 		return { error: `getReportData failed: ${errorMessage(e)}` };
 	}
 }
-/**
-* Loads the workspace's plugins the way nx does and counts the files each
-* plugin's createNodes glob matches, grouped by basename. A config file can
-* yield more than one project, so this bounds what a plugin contributes rather
-* than counting its projects.
-*/
 async function readPluginConfigFiles(ws) {
 	const root = ws.root;
 	const getPlugins = resolveNxInternal(ws, "project-graph/plugins/get-plugins");
@@ -430,10 +425,12 @@ async function readPluginConfigFiles(ws) {
 		const { findMatchingConfigFiles } = ws.require(configUtils);
 		const plugins = await loadPlugins(readNxJson(root), root);
 		const result = [];
+		const matchedByPlugin = /* @__PURE__ */ new Map();
 		for (const plugin of plugins) {
 			if (!plugin.createNodes) continue;
 			const pattern = plugin.createNodes[0];
 			const matched = findMatchingConfigFiles(globWithWorkspaceContextSync(root, [pattern]), plugin.include, plugin.exclude);
+			matchedByPlugin.set(plugin.name, [...matchedByPlugin.get(plugin.name) ?? [], ...matched]);
 			const counts = /* @__PURE__ */ new Map();
 			for (const file of matched) {
 				const base = node_path.default.basename(file);
@@ -452,14 +449,15 @@ async function readPluginConfigFiles(ws) {
 			});
 		}
 		cleanupPlugins?.();
-		return result;
+		return {
+			summary: result,
+			matched: matchedByPlugin
+		};
 	} catch (e) {
 		return { error: `plugin inspection failed: ${errorMessage(e)}` };
 	}
 }
-const NOT_A_SOURCE_EDIT = /* @__PURE__ */ new Set([
-	"project.json",
-	"package.json",
+const LOCK_FILES = /* @__PURE__ */ new Set([
 	"package-lock.json",
 	"pnpm-lock.yaml",
 	"yarn.lock",
@@ -467,29 +465,58 @@ const NOT_A_SOURCE_EDIT = /* @__PURE__ */ new Set([
 	"bun.lockb"
 ]);
 /**
-* A random file of a random project, from the file map the daemon wrote during
-* the cold run. Config and lock files are skipped so the edit is the ordinary
-* kind: a source change that touches hashes and dependencies, not project
-* discovery.
+* Files an edit must not touch: the daemon restarts itself when a lock file's
+* hash changes, and the root package.json and nx.json describe the workspace
+* rather than a project. A plugin whose glob matches only these gets no run.
 */
-function pickEditTarget(ws) {
+const neverEdit = (file) => LOCK_FILES.has(node_path.default.basename(file)) || file === "package.json" || file === "nx.json";
+const pick = (items) => items[Math.floor(Math.random() * items.length)];
+/** File to project, from the file map the daemon wrote during the cold run. */
+function readProjectOfFile(ws) {
+	const owner = /* @__PURE__ */ new Map();
 	const fileMap = node_path.default.join(ws.root, ".nx", "workspace-data", "file-map.json");
-	if (!node_fs.default.existsSync(fileMap)) return null;
+	if (!node_fs.default.existsSync(fileMap)) return owner;
 	try {
 		const projectFileMap = JSON.parse(node_fs.default.readFileSync(fileMap, "utf8")).fileMap.projectFileMap;
-		const candidates = Object.values(projectFileMap).map((files) => files.map((f) => f.file).filter((f) => !NOT_A_SOURCE_EDIT.has(node_path.default.basename(f)))).filter((files) => files.length > 0);
-		if (!candidates.length) return null;
-		const files = candidates[Math.floor(Math.random() * candidates.length)];
-		return files[Math.floor(Math.random() * files.length)];
-	} catch {
-		return null;
-	}
+		for (const [project, files] of Object.entries(projectFileMap)) for (const f of files) owner.set(f.file, project);
+	} catch {}
+	return owner;
+}
+/**
+* One edit per plugin that matched config files, then `sourceEdits` edits of
+* ordinary source files. Each edit lands in a project no earlier edit used,
+* as long as there are enough projects, so the runs exercise different parts
+* of the graph rather than one hot spot.
+*/
+function planEdits(ws, matched, sourceEdits) {
+	const owner = readProjectOfFile(ws);
+	const projectOf = (file) => owner.get(file) ?? file;
+	const usedProjects = /* @__PURE__ */ new Set();
+	const usedFiles = /* @__PURE__ */ new Set();
+	const plan = [];
+	const take = (files, plugin) => {
+		const fresh = files.filter((f) => !usedFiles.has(f) && !neverEdit(f));
+		if (!fresh.length) return;
+		const unusedProject = fresh.filter((f) => !usedProjects.has(projectOf(f)));
+		const file = pick(unusedProject.length ? unusedProject : fresh);
+		usedFiles.add(file);
+		usedProjects.add(projectOf(file));
+		plan.push({
+			file,
+			plugin
+		});
+	};
+	for (const [plugin, files] of matched) take(files, plugin);
+	const configFiles = new Set([...matched.values()].flat());
+	const sourceFiles = [...owner.keys()].filter((f) => !configFiles.has(f) && !neverEdit(f));
+	for (let i = 0; i < sourceEdits; i++) take(sourceFiles, null);
+	return plan;
 }
 /** Appends a newline per touch and puts the original bytes back on restore. */
-function installEdit(ws, file) {
-	const absolute = node_path.default.join(ws.root, file);
+function installEdit(ws, plan) {
+	const absolute = node_path.default.join(ws.root, plan.file);
 	if (!node_fs.default.existsSync(absolute)) {
-		console.warn(`edit target ${file} does not exist; skipping semi-warm runs`);
+		console.warn(`edit target ${plan.file} does not exist; skipping it`);
 		return null;
 	}
 	const original = node_fs.default.readFileSync(absolute);
@@ -498,10 +525,14 @@ function installEdit(ws, file) {
 		if (restored) return;
 		restored = true;
 		node_fs.default.writeFileSync(absolute, original);
+		if (!node_fs.default.readFileSync(absolute).equals(original)) {
+			node_fs.default.writeFileSync(absolute, original);
+			if (!node_fs.default.readFileSync(absolute).equals(original)) console.warn(`could not restore ${plan.file}; check it by hand`);
+		}
 	};
 	process.on("exit", restore);
 	return {
-		file,
+		...plan,
 		touch: () => node_fs.default.appendFileSync(absolute, "\n"),
 		restore
 	};
@@ -678,7 +709,7 @@ const KEY_PHASES = [
 ];
 function renderMarkdown(r) {
 	const sys = r.system;
-	const summary = ul(`Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`, `Projects: ${r.projectCount}`, `Cold ${code("nx show projects")} after ${code("nx reset")}: ${r.coldGraphMs} ms`, `Warm runs: ${r.warmMs.join(", ") || "none"}${r.warmMs.length ? ` ms (median ${Math.round(median(r.warmMs))} ms)` : ""}`, ...r.editedFile ? [`Semi-warm runs, after appending a line to ${code(r.editedFile)}: ${r.semiWarmMs.join(", ")} ms`] : [], ...r.reset ? [] : ["Daemon was not reset, so the cold run is only cold if no daemon was running."]);
+	const summary = ul(`Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`, `Projects: ${r.projectCount}`, `Cold ${code("nx show projects")} after ${code("nx reset")}: ${r.coldGraphMs} ms`, `Warm runs: ${r.warmMs.join(", ") || "none"}${r.warmMs.length ? ` ms (median ${Math.round(median(r.warmMs))} ms)` : ""}`, ...r.edits.length ? [`Semi-warm runs, each after appending a line to one file: ${r.semiWarmMs.join(", ")} ms`] : [], ...r.reset ? [] : ["Daemon was not reset, so the cold run is only cold if no daemon was running."]);
 	const sections = [];
 	if (r.traces.length === 0) sections.push("No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.");
 	else {
@@ -686,6 +717,7 @@ function renderMarkdown(r) {
 		const semiWarmRuns = r.runs.filter((run) => run.phase === "semi-warm").length;
 		const plural = (n) => n === 1 ? "" : "s";
 		sections.push(h2("Processes", renderProcesses(r.traces, warmRuns, semiWarmRuns), `Sums count nested measures once, through the outermost one, and are per run: ${warmRuns} warm run${plural(warmRuns)}, ${semiWarmRuns} semi-warm run${plural(semiWarmRuns)} after a file edit. Every measure is in graph-perf.json.`));
+		if (r.edits.length) sections.push(h2("Semi-warm runs", "One run per plugin whose glob matched a file, editing one of those files, then source-file edits. Daemon is the sum of its top-level measures inside that run.", renderSemiWarmRuns(r)));
 		sections.push(h2("Key phases", "A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.", renderKeyPhases(r.workspaceRoot, r.traces)));
 	}
 	sections.push(h2("Plugin config files", ...renderPluginConfigFiles(r.pluginConfigFiles)));
@@ -693,6 +725,32 @@ function renderMarkdown(r) {
 	sections.push(h2("nx report", ...renderReport(r.report, r.traces, r.records !== null)));
 	sections.push(h2("nx.json", ...["plugins", "targetDefaults"].map((key) => h3(key, codeBlock(JSON.stringify("error" in r.nxJson ? r.nxJson.error : r.nxJson[key] ?? null, null, 2), "json")))));
 	return h1("Nx graph construction", summary, ...sections) + "\n";
+}
+function renderSemiWarmRuns(r) {
+	const daemon = r.traces.find((t) => t.role === "daemon");
+	const rows = r.runs.filter((run) => run.phase === "semi-warm");
+	return table(rows, [
+		{
+			label: "run",
+			mapFn: (run) => run.index
+		},
+		{
+			label: "edited file",
+			mapFn: (run) => code(run.file ?? "?")
+		},
+		{
+			label: "matched by",
+			mapFn: (run) => run.plugin ? cell(run.plugin) : "no plugin (source file)"
+		},
+		{
+			label: "client",
+			mapFn: (run) => ms(run.wallMs)
+		},
+		{
+			label: "daemon",
+			mapFn: (run) => daemon ? ms(topLevelMs(daemon.measures.filter((m) => m.run === run.index))) : "-"
+		}
+	]);
 }
 function renderProcesses(traces, warmRuns, semiWarmRuns) {
 	const earliest = Math.min(...traces.map((t) => t.timeOrigin));
@@ -788,12 +846,8 @@ const mermaidLabel = (text) => text.replace(/[:;#]/g, "-");
 * Times count from the phase's first run window.
 */
 function renderTimelines(r) {
-	const parts = ["Bars are top-level measures and key phases; time counts from the start of the first run of that kind."];
-	for (const phase of [
-		"cold",
-		"warm",
-		"semi-warm"
-	]) {
+	const parts = ["Cold and warm only. Bars are top-level measures and key phases; time counts from the start of the first run of that kind."];
+	for (const phase of ["cold", "warm"]) {
 		const windows = r.runs.filter((run) => run.phase === phase);
 		if (!windows.length) continue;
 		const t0 = windows[0].startedAt;
@@ -889,7 +943,7 @@ async function run(argv, workspaceRoot) {
 		assertOk("nx reset", nx(ws, ["reset"]));
 	}
 	let instrument = null;
-	let edit = null;
+	const edits = [];
 	if (opts.instrument) {
 		const source = opts.instrumentFile ? node_fs.default.readFileSync(node_path.default.resolve(opts.instrumentFile), "utf8") : instrumentSource();
 		console.log(`instrumenting nx perf-logging${opts.instrumentFile ? ` from ${opts.instrumentFile}` : ""}`);
@@ -936,13 +990,23 @@ async function run(argv, workspaceRoot) {
 			});
 		}
 		const warmMs = runs.filter((run) => run.phase === "warm").map((run) => run.wallMs);
-		if (opts.edits > 0) {
-			const target = opts.editFile ?? pickEditTarget(ws);
-			if (!target) console.warn("no project file to edit; skipping semi-warm runs");
-			else edit = installEdit(ws, target);
+		withdrawSession(ws);
+		console.log("plugin config files");
+		const inspection = await readPluginConfigFiles(ws);
+		if (instrument) announceSession(ws);
+		if (opts.edit) {
+			const plan = opts.editFile ? [{
+				file: opts.editFile,
+				plugin: null
+			}] : planEdits(ws, "error" in inspection ? /* @__PURE__ */ new Map() : inspection.matched, opts.sourceEdits);
+			if (!plan.length) console.warn("nothing to edit; skipping semi-warm runs");
+			for (const item of plan) {
+				const edit = installEdit(ws, item);
+				if (edit) edits.push(edit);
+			}
 		}
-		if (edit) for (let i = 1; i <= opts.edits; i++) {
-			console.log(`semi-warm run ${i} of ${opts.edits}: editing ${edit.file}`);
+		for (const [i, edit] of edits.entries()) {
+			console.log(`semi-warm run ${i + 1} of ${edits.length}: editing ${edit.file}${edit.plugin ? ` (${edit.plugin})` : ""}`);
 			const editedAt = Date.now();
 			edit.touch();
 			await sleep(500);
@@ -957,7 +1021,9 @@ async function run(argv, workspaceRoot) {
 				phase: "semi-warm",
 				startedAt: editedAt,
 				endedAt: semiWarm.endedAt,
-				wallMs: semiWarm.wallMs
+				wallMs: semiWarm.wallMs,
+				file: edit.file,
+				plugin: edit.plugin
 			});
 		}
 		const semiWarmMs = runs.filter((run) => run.phase === "semi-warm").map((run) => run.wallMs);
@@ -965,8 +1031,7 @@ async function run(argv, workspaceRoot) {
 		const traces = instrument ? readTraces(ws, runs) : [];
 		console.log("nx report data");
 		const report = await readReportData(ws);
-		console.log("plugin config files");
-		const pluginConfigFiles = await readPluginConfigFiles(ws);
+		const pluginConfigFiles = "error" in inspection ? inspection : inspection.summary;
 		const result = {
 			collectedAt: startedAt,
 			workspaceRoot: ws.root,
@@ -984,7 +1049,10 @@ async function run(argv, workspaceRoot) {
 			warmMs: warmMs.map(Math.round),
 			warmMedianMs: warmMs.length ? Math.round(median(warmMs)) : null,
 			semiWarmMs: semiWarmMs.map(Math.round),
-			editedFile: edit?.file ?? null,
+			edits: edits.map(({ file, plugin }) => ({
+				file,
+				plugin
+			})),
 			reset: opts.reset,
 			runs,
 			records: instrument ? node_path.default.relative(ws.root, ws.sessionDir) : null,
@@ -998,7 +1066,7 @@ async function run(argv, workspaceRoot) {
 		console.log(`wrote ${node_path.default.join(outDir, "graph-perf.md")} and graph-perf.json`);
 		console.log(`projects ${projects.length}, cold ${result.coldGraphMs}ms, warm median ${result.warmMedianMs ?? "n/a"}ms, semi-warm ${semiWarmMs.length ? `${semiWarmMs.map(Math.round).join("/")}ms` : "n/a"}, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`);
 	} finally {
-		edit?.restore();
+		for (const edit of edits) edit.restore();
 		withdrawSession(ws);
 		instrument?.restore();
 	}
