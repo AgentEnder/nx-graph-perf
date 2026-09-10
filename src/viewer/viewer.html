@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>__TITLE__</title>
+    <style>
+      /*__CSS__*/
+    </style>
+  </head>
+  <body>
+    <main class="viz">
+      <h1 id="title"></h1>
+      <p class="sub" id="subtitle"></p>
+
+      <div class="filters">
+        <label for="run">Run</label>
+        <select id="run"></select>
+        <label for="filter">Measure</label>
+        <input id="filter" type="search" placeholder="filter by name" />
+        <button id="reset" type="button">Reset zoom</button>
+        <span class="hint" id="hint">ctrl-scroll or pinch to zoom, drag or swipe sideways to pan</span>
+        <span class="spacer"></span>
+        <button
+          id="trace"
+          type="button"
+          title="Opens ui.perfetto.dev in a new tab and hands it this trace. Perfetto reads the trace in the browser; nothing is uploaded."
+        >
+          Open in Perfetto
+        </button>
+        <button id="table-view" type="button" aria-pressed="false">Table</button>
+        <button id="theme" type="button">Dark</button>
+      </div>
+
+      <div class="stats">
+        <div>
+          <span class="stat-label">Wall time</span>
+          <span class="stat-value" id="stat-wall"></span>
+        </div>
+        <div>
+          <span class="stat-label">Processes</span>
+          <span class="stat-value" id="stat-procs"></span>
+        </div>
+        <div>
+          <span class="stat-label">Measures</span>
+          <span class="stat-value" id="stat-measures"></span>
+        </div>
+        <div>
+          <span class="stat-label">Longest measure</span>
+          <span class="stat-value" id="stat-longest"></span>
+        </div>
+        <div class="legend" id="legend"></div>
+      </div>
+
+      <div class="panel" id="chart">
+        <div id="axis">
+          <div id="ticks"></div>
+          <div
+            id="scrollbar"
+            role="scrollbar"
+            aria-orientation="horizontal"
+            aria-controls="lanes"
+            aria-label="Visible time range"
+            tabindex="0"
+          >
+            <div id="thumb"></div>
+          </div>
+        </div>
+        <div id="lanes"></div>
+      </div>
+
+      <div class="panel" id="table" hidden></div>
+    </main>
+
+    <div class="tip" id="tip" hidden role="status" aria-live="polite">
+      <div class="tip-value" id="tip-value"></div>
+      <div class="tip-name" id="tip-name"></div>
+      <div class="tip-meta" id="tip-meta"></div>
+    </div>
+
+    <script id="data" type="application/json">
+      /*__DATA__*/
+    </script>
+    <script id="trace-data" type="application/json">
+      /*__TRACE__*/
+    </script>
+    <script>
+      /*__JS__*/
+    </script>
+  </body>
+</html>

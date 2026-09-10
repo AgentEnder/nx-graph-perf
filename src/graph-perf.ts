@@ -33,6 +33,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as md from 'markdown-factory';
 import { instrumentSource } from './instrument';
+import { viewerAssets } from './viewer-assets';
 
 interface Options {
   runs: number;
@@ -944,7 +945,15 @@ function renderMarkdown(r: Collected): string {
     );
   }
   sections.push(md.h2('Plugin config files', ...renderPluginConfigFiles(r.pluginConfigFiles)));
-  if (r.traces.length) sections.push(md.h2('Timelines', ...renderTimelines(r)));
+  if (r.traces.length) {
+    sections.push(
+      md.h2(
+        'Timelines',
+        `${md.code('graph-perf.html')} is an interactive timeline of every run: one lane per Nx process, one bar per measure, nested measures below the one that contains them. It is a single file with no network access, so opening it locally is enough.`,
+        `${md.code('graph-perf.trace.json')} is the same measures in Chrome Trace Event Format, for ${md.link('https://speedscope.app', 'speedscope')} or any flamegraph viewer that reads it. The viewer carries a copy, so its ${md.code('Open in Perfetto')} button needs no file at all. Perfetto opens with every process collapsed, so press expand-all above the track list to get named tracks and slices.`,
+      ),
+    );
+  }
   sections.push(md.h2('nx report', ...renderReport(r.report, r.traces, r.instrumented)));
 
   const nxJsonKeys = ['plugins', 'targetDefaults'] as const;
@@ -1050,47 +1059,218 @@ function renderKeyPhases(root: string, traces: ProcessTrace[]): string {
   ]);
 }
 
-const isKeyPhase = (name: string, kind: string) =>
-  KEY_PHASES.some((p) => p.pattern.test(name) && (!p.role || p.role === kind));
+const round1 = (n: number) => Math.round(n * 10) / 10;
 
-/** Mermaid text is split on colons and semicolons; keep labels to safe characters. */
-const mermaidLabel = (text: string) => text.replace(/[:;#]/g, '-');
+const escapeHtml = (text: string) =>
+  text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+type TimelineBar = [run: number, name: number, start: number, duration: number];
+
+type TimelineData = {
+  title: string;
+  subtitle: string;
+  /** Measure names, interned; they repeat across every process and run. */
+  names: string[];
+  /** Process roles, interned, each with the index of its kind. */
+  roles: [label: string, kind: number][];
+  runs: { label: string; wallMs: number }[];
+  lanes: { p: number; r: number; b: TimelineBar[] }[];
+};
+
+/** Kind order the viewer colours by; anything else takes its neutral fourth slot. */
+const KIND_ORDER = ['client', 'daemon', 'plugin worker'];
+
+/** Labels each run gets in the viewer and the trace: the phase and its cycle. */
+function runLabels(runs: Run[]): string[] {
+  const seen: Record<string, number> = {};
+  return runs.map((run) => {
+    seen[run.phase] = (seen[run.phase] ?? 0) + 1;
+    return `Cycle ${seen[run.phase]} \u00b7 ${run.phase}`;
+  });
+}
+
+/** Every measure of every run, compacted for the browser. */
+function timelineData(r: Collected): TimelineData {
+  const names: string[] = [];
+  const nameIds = new Map<string, number>();
+  const intern = (name: string) => {
+    const seen = nameIds.get(name);
+    if (seen !== undefined) return seen;
+    nameIds.set(name, names.length);
+    return names.push(name) - 1;
+  };
+
+  const roles: [string, number][] = [];
+  const roleIds = new Map<string, number>();
+  const internRole = (role: string) => {
+    const seen = roleIds.get(role);
+    if (seen !== undefined) return seen;
+    const kind = KIND_ORDER.indexOf(roleKind(role));
+    roleIds.set(role, roles.length);
+    return roles.push([role, kind === -1 ? KIND_ORDER.length : kind]) - 1;
+  };
+
+  const startedAt = new Map(r.runs.map((run) => [run.index, run.startedAt]));
+  const lanes: TimelineData['lanes'] = [];
+  for (const t of r.traces) {
+    const bars: TimelineBar[] = [];
+    for (const m of t.measures) {
+      const t0 = startedAt.get(m.run);
+      if (t0 === undefined) continue;
+      const name = intern(shortName(r.workspaceRoot, m.name));
+      bars.push([m.run, name, round1(t.timeOrigin + m.startTime - t0), round1(m.duration)]);
+    }
+    if (bars.length) lanes.push({ p: t.pid, r: internRole(t.role), b: bars });
+  }
+
+  const sys = r.system;
+  return {
+    title: `Nx graph construction \u00b7 ${path.basename(r.workspaceRoot)}`,
+    subtitle: `${r.projectCount} projects \u00b7 ${sys.platform} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB \u00b7 node ${sys.node} \u00b7 collected ${r.collectedAt}`,
+    names,
+    roles,
+    runs: runLabels(r.runs).map((label, i) => ({ label, wallMs: round1(r.runs[i].wallMs) })),
+    lanes,
+  };
+}
 
 /**
- * One Gantt chart per phase: every process that did work in that phase is a
- * section, and its top-level measures plus the key phases are the bars.
- * Times count from the phase's first run window.
+ * The viewer with its stylesheet, script, chart data and trace inlined into one
+ * file. The trace rides along because a page opened over `file:` cannot read
+ * its own siblings, and handing it to Perfetto needs the bytes in hand.
  */
-function renderTimelines(r: Collected): string[] {
-  const parts: string[] = [
-    'First cycle, cold and warm only. Bars are top-level measures and key phases; time counts from the start of that run.',
-  ];
-  // Semi-warm runs restart every worker per edit, which draws as a wall of
-  // bars; the per-run table carries that phase instead.
-  for (const phase of ['cold', 'warm'] as Phase[]) {
-    const first = r.runs.find((run) => run.phase === phase);
-    if (!first) continue;
-    const t0 = first.startedAt;
-    const lines = ['gantt', `  title ${phase}`, '  dateFormat x', '  axisFormat %S.%Ls', '  todayMarker off'];
-    let bars = 0;
-    for (const t of r.traces) {
-      const kind = roleKind(t.role);
-      const inPhase = t.measures.filter((m) => m.phase === phase && m.run === first.index);
-      if (!inPhase.length) continue;
-      const outer = new Set(topLevel(inPhase));
-      const shown = inPhase.filter((m) => outer.has(m) || isKeyPhase(m.name, kind));
-      if (!shown.length) continue;
-      lines.push(`  section ${mermaidLabel(t.role)} ${t.pid}`);
-      for (const m of shown) {
-        const start = Math.round(t.timeOrigin + m.startTime - t0);
-        const end = start + Math.max(1, Math.round(m.duration));
-        lines.push(`  ${mermaidLabel(shortName(r.workspaceRoot, m.name))} :${start}, ${end}`);
-        bars++;
+export function renderHtml(r: Collected): string {
+  const { html, css, js } = viewerAssets();
+  const data = timelineData(r);
+  // Escaping `<` keeps a measure name from closing the script element.
+  const embed = (value: string) => value.replace(/</g, '\\u003c');
+  return html
+    .replace('__TITLE__', () => escapeHtml(data.title))
+    .replace('/*__CSS__*/', () => css)
+    .replace('/*__DATA__*/', () => embed(JSON.stringify(data)))
+    .replace('/*__TRACE__*/', () => embed(renderTrace(r).trim()))
+    .replace('/*__JS__*/', () => js);
+}
+
+type TraceEvent = {
+  name: string;
+  ph: 'X' | 'M';
+  pid: number;
+  tid: number;
+  ts?: number;
+  dur?: number;
+  cat?: string;
+  args?: Record<string, unknown>;
+};
+
+/**
+ * Thread ids for one process's measures. The trace format only stacks events
+ * that nest strictly, so a measure joins a track when it fits inside that
+ * track's innermost open event and starts a new one when it merely overlaps.
+ */
+function assignTracks(measures: MeasureRecord[]): { measure: MeasureRecord; track: number }[] {
+  const ordered = [...measures].sort((a, b) => a.startTime - b.startTime || b.duration - a.duration);
+  const tracks: number[][] = [];
+  return ordered.map((measure) => {
+    const end = measure.startTime + measure.duration;
+    for (const [index, stack] of tracks.entries()) {
+      while (stack.length && stack[stack.length - 1] <= measure.startTime) stack.pop();
+      if (stack.length === 0 || end <= stack[stack.length - 1]) {
+        stack.push(end);
+        return { measure, track: index };
       }
     }
-    if (bars) parts.push(md.h3(phase, md.codeBlock(lines.join('\n'), 'mermaid')));
+    tracks.push([end]);
+    return { measure, track: tracks.length - 1 };
+  });
+}
+
+/**
+ * Chrome Trace Event Format, which Perfetto, speedscope and the flamegraph
+ * TUIs all read. One process per Nx process, one thread per stack of nested
+ * measures, microseconds from the first thing that happened, so every cycle
+ * sits on one timeline.
+ */
+export function renderTrace(r: Collected): string {
+  const origin = Math.min(...r.traces.map((t) => t.timeOrigin), ...r.runs.map((run) => run.startedAt));
+  const us = (epochMs: number) => Math.round((epochMs - origin) * 1000);
+  // A process's offset is kept out of the sum with its measure times. Folding
+  // an epoch millisecond into that addition costs enough precision to round a
+  // child past the end of its parent, which the trace format rejects.
+  const offsetUs = (timeOrigin: number) => (timeOrigin - origin) * 1000;
+
+  const events: TraceEvent[] = [
+    { name: 'process_name', ph: 'M', pid: 0, tid: 0, args: { name: 'runs' } },
+    { name: 'process_sort_index', ph: 'M', pid: 0, tid: 0, args: { sort_index: -1 } },
+  ];
+
+  const labels = runLabels(r.runs);
+  for (const [i, run] of r.runs.entries()) {
+    events.push({
+      name: labels[i],
+      ph: 'X',
+      cat: 'run',
+      pid: 0,
+      tid: 0,
+      ts: us(run.startedAt),
+      dur: us(run.endedAt) - us(run.startedAt),
+      args: { phase: run.phase, run: run.index, wallMs: round1(run.wallMs) },
+    });
   }
-  return parts;
+
+  // Thread ids are global in this format, so numbering tracks within a process
+  // makes every process claim tid 0 and the importer drops the names.
+  let nextTid = 1;
+
+  // Traces arrive sorted by time origin, which is the order to show them in.
+  for (const [order, t] of r.traces.entries()) {
+    events.push(
+      { name: 'process_name', ph: 'M', pid: t.pid, tid: 0, args: { name: `${t.role} (${t.pid})` } },
+      { name: 'process_sort_index', ph: 'M', pid: t.pid, tid: 0, args: { sort_index: order } },
+    );
+    const kind = roleKind(t.role);
+    const offset = offsetUs(t.timeOrigin);
+    const tids = new Map<number, number>();
+    const tidFor = (track: number) => {
+      const seen = tids.get(track);
+      if (seen !== undefined) return seen;
+      tids.set(track, nextTid);
+      return nextTid++;
+    };
+    for (const { measure, track } of assignTracks(t.measures)) {
+      const tid = tidFor(track);
+      const ts = Math.round(offset + measure.startTime * 1000);
+      const end = Math.round(offset + (measure.startTime + measure.duration) * 1000);
+      events.push({
+        name: shortName(r.workspaceRoot, measure.name),
+        ph: 'X',
+        cat: kind,
+        pid: t.pid,
+        tid,
+        ts,
+        dur: end - ts,
+        args: { phase: measure.phase, run: measure.run, ...(measure.detail ? { detail: measure.detail } : {}) },
+      });
+    }
+    // Naming a track after the process keeps a hover useful wherever it lands.
+    for (const [track, tid] of tids) {
+      const name = track === 0 ? t.role : `${t.role} #${track + 1}`;
+      events.push({ name: 'thread_name', ph: 'M', pid: t.pid, tid, args: { name } });
+      events.push({ name: 'thread_sort_index', ph: 'M', pid: t.pid, tid, args: { sort_index: track } });
+    }
+  }
+
+  return (
+    JSON.stringify({
+      displayTimeUnit: 'ms',
+      otherData: {
+        workspace: r.workspaceRoot,
+        collectedAt: r.collectedAt,
+        projects: String(r.projectCount),
+      },
+      traceEvents: events,
+    }) + '\n'
+  );
 }
 
 function renderPluginConfigFiles(plugins: PluginConfigFiles[] | Failure): string[] {
@@ -1338,9 +1518,14 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
 
     fs.writeFileSync(path.join(outDir, 'graph-perf.md'), renderMarkdown(result));
     fs.writeFileSync(path.join(outDir, 'graph-perf.json'), JSON.stringify(result, null, 2) + '\n');
+    if (traces.length) {
+      fs.writeFileSync(path.join(outDir, 'graph-perf.html'), renderHtml(result));
+      fs.writeFileSync(path.join(outDir, 'graph-perf.trace.json'), renderTrace(result));
+    }
 
     const med = (values: number[]) => (values.length ? `${Math.round(median(values))}ms` : 'n/a');
-    console.log(`wrote ${path.join(outDir, 'graph-perf.md')} and graph-perf.json`);
+    const written = ['graph-perf.json', ...(traces.length ? ['graph-perf.html', 'graph-perf.trace.json'] : [])];
+    console.log(`wrote ${path.join(outDir, 'graph-perf.md')}, ${written.join(', ')}`);
     console.log(
       `projects ${projects.length}, cycles ${opts.runs}, cold median ${med(result.coldMs)}, warm median ${med(result.warmMs)}, semi-warm median ${med(result.semiWarmMs)}, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`,
     );

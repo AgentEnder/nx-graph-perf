@@ -122,6 +122,22 @@ function h3(title, ...contents) {
 	return h(3, title, ...contents);
 }
 /**
+* Function to link to an external resource.
+* @param ref The reference to link to.
+* @param title The title/label of the link.
+* @returns Markdown link to the external resource.
+* @example
+* ```typescript
+* console.log(link('https://example.com', 'Example'));
+* // Prints:
+* //
+* // [Example](https://example.com)
+* ```
+*/
+function link(ref, title) {
+	return `[${title ?? ref}](${ref})`;
+}
+/**
 * Function to create inline code.
 * @param contents The code to inline.
 * @returns Markdown inline code.
@@ -242,6 +258,16 @@ function assert(check, message, allowByPass = true) {
 //#region src/instrument.ts
 function instrumentSource() {
 	return "\"use strict\";\n// Drop-in replacement for nx's perf-logging.js, installed by graph-perf.js for\n// the duration of a measurement and restored afterwards.\n//\n// The original module is kept beside this one as perf-logging.js.graph-perf-backup\n// and loaded first, so whatever this nx version does with measures (perf log\n// lines, analytics) keeps happening. This module only adds a second observer\n// that appends every measure as one JSON line to <session dir>/<pid>.jsonl,\n// where the session directory is read from a marker file beside this module.\n// Without that marker the observer does nothing.\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst perf_hooks_1 = require(\"perf_hooks\");\nconst fs = require(\"fs\");\nconst path = require(\"path\");\n\ntry {\n    require(\"./perf-logging.js.graph-perf-backup\");\n} catch {\n    // No original to delegate to; recording still works.\n}\n\nlet recorder = { session: null, file: null };\n// Written by graph-perf.js next to this module; holds the session directory.\nconst marker = path.join(__dirname, 'perf-logging.js.graph-perf-session');\n\n// Re-reads the marker on every batch: a long-lived daemon outlives the session\n// that started it, and its measures must land with whichever session is active\n// now, or nowhere when none is.\nfunction getRecorder() {\n    try {\n        const session = fs.existsSync(marker) ? fs.readFileSync(marker, 'utf8').trim() : '';\n        if (!session) {\n            recorder = { session: null, file: null };\n            return recorder;\n        }\n        if (recorder.session === session) return recorder;\n        const dir = session;\n        fs.mkdirSync(dir, { recursive: true });\n        const file = path.join(dir, `${process.pid}.jsonl`);\n        // Header line, so the file says which process it belongs to.\n        fs.appendFileSync(file, JSON.stringify({\n            kind: 'process',\n            pid: process.pid,\n            ppid: process.ppid,\n            argv: process.argv,\n            execArgv: process.execArgv,\n            cwd: process.cwd(),\n            node: process.version,\n            timeOrigin: perf_hooks_1.performance.timeOrigin,\n        }) + '\\n');\n        recorder = { session, file };\n    } catch {\n        recorder = { session: null, file: null };\n    }\n    return recorder;\n}\n\nfunction safeDetail(detail) {\n    if (detail === undefined || detail === null) return null;\n    try {\n        return JSON.parse(JSON.stringify(detail));\n    } catch {\n        return String(detail);\n    }\n}\n\nnew perf_hooks_1.PerformanceObserver((list) => {\n    const rec = getRecorder();\n    if (!rec.file) return;\n    let lines = '';\n    for (const entry of list.getEntries()) {\n        lines += JSON.stringify({\n            kind: 'measure',\n            pid: process.pid,\n            name: entry.name,\n            startTime: entry.startTime,\n            duration: entry.duration,\n            detail: safeDetail(entry.detail),\n        }) + '\\n';\n    }\n    try {\n        fs.appendFileSync(rec.file, lines);\n    } catch {\n        // Recording is best effort; never break the process being measured.\n    }\n}).observe({ entryTypes: ['measure'] });\n";
+}
+
+//#endregion
+//#region src/viewer-assets.ts
+function viewerAssets() {
+	return {
+		"html": "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <title>__TITLE__</title>\n    <style>\n      /*__CSS__*/\n    </style>\n  </head>\n  <body>\n    <main class=\"viz\">\n      <h1 id=\"title\"></h1>\n      <p class=\"sub\" id=\"subtitle\"></p>\n\n      <div class=\"filters\">\n        <label for=\"run\">Run</label>\n        <select id=\"run\"></select>\n        <label for=\"filter\">Measure</label>\n        <input id=\"filter\" type=\"search\" placeholder=\"filter by name\" />\n        <button id=\"reset\" type=\"button\">Reset zoom</button>\n        <span class=\"hint\" id=\"hint\">ctrl-scroll or pinch to zoom, drag or swipe sideways to pan</span>\n        <span class=\"spacer\"></span>\n        <button\n          id=\"trace\"\n          type=\"button\"\n          title=\"Opens ui.perfetto.dev in a new tab and hands it this trace. Perfetto reads the trace in the browser; nothing is uploaded.\"\n        >\n          Open in Perfetto\n        </button>\n        <button id=\"table-view\" type=\"button\" aria-pressed=\"false\">Table</button>\n        <button id=\"theme\" type=\"button\">Dark</button>\n      </div>\n\n      <div class=\"stats\">\n        <div>\n          <span class=\"stat-label\">Wall time</span>\n          <span class=\"stat-value\" id=\"stat-wall\"></span>\n        </div>\n        <div>\n          <span class=\"stat-label\">Processes</span>\n          <span class=\"stat-value\" id=\"stat-procs\"></span>\n        </div>\n        <div>\n          <span class=\"stat-label\">Measures</span>\n          <span class=\"stat-value\" id=\"stat-measures\"></span>\n        </div>\n        <div>\n          <span class=\"stat-label\">Longest measure</span>\n          <span class=\"stat-value\" id=\"stat-longest\"></span>\n        </div>\n        <div class=\"legend\" id=\"legend\"></div>\n      </div>\n\n      <div class=\"panel\" id=\"chart\">\n        <div id=\"axis\">\n          <div id=\"ticks\"></div>\n          <div\n            id=\"scrollbar\"\n            role=\"scrollbar\"\n            aria-orientation=\"horizontal\"\n            aria-controls=\"lanes\"\n            aria-label=\"Visible time range\"\n            tabindex=\"0\"\n          >\n            <div id=\"thumb\"></div>\n          </div>\n        </div>\n        <div id=\"lanes\"></div>\n      </div>\n\n      <div class=\"panel\" id=\"table\" hidden></div>\n    </main>\n\n    <div class=\"tip\" id=\"tip\" hidden role=\"status\" aria-live=\"polite\">\n      <div class=\"tip-value\" id=\"tip-value\"></div>\n      <div class=\"tip-name\" id=\"tip-name\"></div>\n      <div class=\"tip-meta\" id=\"tip-meta\"></div>\n    </div>\n\n    <script id=\"data\" type=\"application/json\">\n      /*__DATA__*/\n    <\/script>\n    <script id=\"trace-data\" type=\"application/json\">\n      /*__TRACE__*/\n    <\/script>\n    <script>\n      /*__JS__*/\n    <\/script>\n  </body>\n</html>\n",
+		"css": "/* Light is the base; the media query covers the OS setting and the\n   data-theme scope covers the in-page toggle, which wins either way. */\n\n:root {\n  color-scheme: light;\n  --surface-1: #fcfcfb;\n  --plane: #f9f9f7;\n  --ink: #0b0b0b;\n  --ink-2: #52514e;\n  --muted: #898781;\n  --grid: #e1e0d9;\n  --axis: #c3c2b7;\n  --hairline: rgba(11, 11, 11, 0.1);\n  --client: #2a78d6;\n  --daemon: #eb6834;\n  --worker: #1baf7a;\n  --other: #898781;\n}\n\n@media (prefers-color-scheme: dark) {\n  :root:not([data-theme='light']) {\n    color-scheme: dark;\n    --surface-1: #1a1a19;\n    --plane: #0d0d0d;\n    --ink: #ffffff;\n    --ink-2: #c3c2b7;\n    --muted: #898781;\n    --grid: #2c2c2a;\n    --axis: #383835;\n    --hairline: rgba(255, 255, 255, 0.1);\n    --client: #3987e5;\n    --daemon: #d95926;\n    --worker: #199e70;\n    --other: #898781;\n  }\n}\n\n:root[data-theme='dark'] {\n  color-scheme: dark;\n  --surface-1: #1a1a19;\n  --plane: #0d0d0d;\n  --ink: #ffffff;\n  --ink-2: #c3c2b7;\n  --muted: #898781;\n  --grid: #2c2c2a;\n  --axis: #383835;\n  --hairline: rgba(255, 255, 255, 0.1);\n  --client: #3987e5;\n  --daemon: #d95926;\n  --worker: #199e70;\n  --other: #898781;\n}\n\n* {\n  box-sizing: border-box;\n}\n\nbody {\n  margin: 0;\n  background: var(--plane);\n  color: var(--ink);\n  font:\n    13px/1.5 system-ui,\n    -apple-system,\n    'Segoe UI',\n    sans-serif;\n}\n\n.viz {\n  max-width: 1400px;\n  margin: 0 auto;\n  padding: 24px 20px 64px;\n}\n\nh1 {\n  margin: 0 0 4px;\n  font-size: 19px;\n  font-weight: 600;\n}\n\n.sub {\n  margin: 0;\n  color: var(--ink-2);\n}\n\n/* Filters scope everything below them, so they sit in one row above the chart. */\n\n.filters {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 8px;\n  margin: 20px 0 16px;\n}\n\n.filters label {\n  color: var(--ink-2);\n}\n\nselect,\ninput[type='search'],\nbutton {\n  font: inherit;\n  color: var(--ink);\n  background: var(--surface-1);\n  border: 1px solid var(--hairline);\n  border-radius: 6px;\n  padding: 5px 9px;\n}\n\ninput[type='search'] {\n  min-width: 200px;\n}\n\nbutton {\n  cursor: pointer;\n}\n\nbutton:hover {\n  border-color: var(--axis);\n}\n\nbutton[aria-pressed='true'] {\n  background: var(--ink);\n  color: var(--surface-1);\n  border-color: var(--ink);\n}\n\n.hint {\n  color: var(--muted);\n  font-size: 12px;\n}\n\n.spacer {\n  flex: 1;\n}\n\n.stats {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 28px;\n  padding: 14px 16px;\n  background: var(--surface-1);\n  border: 1px solid var(--hairline);\n  border-radius: 8px 8px 0 0;\n  border-bottom: 0;\n}\n\n.stat-label {\n  display: block;\n  color: var(--muted);\n  font-size: 12px;\n}\n\n.stat-value {\n  display: block;\n  font-size: 22px;\n  font-weight: 600;\n  letter-spacing: -0.01em;\n}\n\n.stat-value small {\n  font-size: 13px;\n  font-weight: 400;\n  color: var(--ink-2);\n}\n\n.legend {\n  display: flex;\n  gap: 16px;\n  align-items: center;\n  margin-left: auto;\n  align-self: center;\n  color: var(--ink-2);\n}\n\n.legend span {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n}\n\n.legend i {\n  width: 12px;\n  height: 12px;\n  border-radius: 2px;\n}\n\n.panel {\n  background: var(--surface-1);\n  border: 1px solid var(--hairline);\n  border-radius: 0 0 8px 8px;\n}\n\n#axis {\n  position: sticky;\n  top: 0;\n  z-index: 2;\n  background: var(--surface-1);\n  border-bottom: 1px solid var(--grid);\n}\n\n#axis svg,\n#lanes svg {\n  display: block;\n  width: 100%;\n}\n\n/* Drawn rather than native: at full zoom the plot would be millions of\n   pixels wide, so the transform stays in script and the thumb reports it. */\n\n#scrollbar {\n  position: relative;\n  height: 9px;\n  margin: 0 12px 5px 0;\n  border-radius: 5px;\n  background: var(--grid);\n  cursor: pointer;\n}\n\n#scrollbar:focus-visible {\n  outline: 2px solid var(--ink);\n  outline-offset: 2px;\n}\n\n#thumb {\n  position: absolute;\n  top: 0;\n  height: 100%;\n  min-width: 24px;\n  border-radius: 5px;\n  background: var(--muted);\n}\n\n#thumb:hover,\n#scrollbar:focus-visible #thumb {\n  background: var(--ink-2);\n}\n\n#scrollbar.dragging #thumb {\n  background: var(--ink);\n}\n\n#lanes {\n  cursor: grab;\n}\n\n#lanes.panning {\n  cursor: grabbing;\n}\n\n.lane-label {\n  fill: var(--ink-2);\n  font-size: 11px;\n}\n\n.lane-rule {\n  stroke: var(--grid);\n  stroke-width: 1;\n}\n\n.tick-line {\n  stroke: var(--grid);\n  stroke-width: 1;\n}\n\n.tick-text {\n  fill: var(--muted);\n  font-size: 11px;\n  font-variant-numeric: tabular-nums;\n}\n\n.bar rect {\n  rx: 2;\n}\n\n.bar {\n  outline: none;\n}\n\n.bar.client rect {\n  fill: var(--client);\n}\n\n.bar.daemon rect {\n  fill: var(--daemon);\n}\n\n.bar.worker rect {\n  fill: var(--worker);\n}\n\n/* Unclassified processes take the de-emphasis gray, never a fourth hue. */\n\n.bar.other rect {\n  fill: var(--other);\n}\n\n/* Hovering one bar recedes the rest, so a single span reads out of a dense run. */\n\n#lanes.hovering .bar:not(.hot) {\n  opacity: 0.3;\n}\n\n.bar.hot rect,\n.bar:focus-visible rect {\n  stroke: var(--ink);\n  stroke-width: 2;\n}\n\n.bar-label {\n  font-size: 10px;\n  pointer-events: none;\n}\n\n.tip {\n  position: fixed;\n  z-index: 5;\n  max-width: 380px;\n  padding: 9px 11px;\n  background: var(--surface-1);\n  border: 1px solid var(--axis);\n  border-radius: 7px;\n  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);\n  pointer-events: none;\n}\n\n.tip[hidden] {\n  display: none;\n}\n\n.tip-value {\n  font-size: 17px;\n  font-weight: 600;\n}\n\n.tip-name {\n  margin-top: 2px;\n  color: var(--ink-2);\n  overflow-wrap: anywhere;\n}\n\n.tip-meta {\n  margin-top: 4px;\n  color: var(--muted);\n  font-size: 12px;\n}\n\ntable {\n  width: 100%;\n  border-collapse: collapse;\n  font-variant-numeric: tabular-nums;\n}\n\ncaption {\n  padding: 12px 16px;\n  text-align: left;\n  color: var(--ink-2);\n}\n\nth,\ntd {\n  padding: 6px 16px;\n  text-align: left;\n  border-bottom: 1px solid var(--grid);\n}\n\nth {\n  color: var(--muted);\n  font-weight: 500;\n}\n\ntd.num {\n  text-align: right;\n}\n\n.empty {\n  padding: 40px 16px;\n  color: var(--muted);\n  text-align: center;\n}\n",
+		"js": "// Interactive timeline for the measures graph-perf records. One lane per Nx\n// process, one bar per measure, packed into rows so a measure nested inside\n// another sits below it and concurrent work sits beside it.\n\n(() => {\n  const data = JSON.parse(document.getElementById('data').textContent);\n\n  const SVG_NS = 'http://www.w3.org/2000/svg';\n  const KINDS = ['client', 'daemon', 'worker', 'other'];\n  const KIND_LABELS = ['Client', 'Daemon', 'Plugin worker', 'Other'];\n  const GUTTER = 250;\n  const ROW_H = 15;\n  const BAR_H = 11;\n  const LANE_GAP = 9;\n  const AXIS_H = 26;\n  const MIN_SPAN = 2;\n\n  const el = (id) => document.getElementById(id);\n  const make = (name) => document.createElementNS(SVG_NS, name);\n\n  // Lane labels are cut from the front, since the plugin and the pid at the\n  // end are what tell two workers apart. The full text stays on the element.\n  const LANE_CHARS = Math.floor((GUTTER - 16) / 6.1);\n  const fitLabel = (text) => (text.length <= LANE_CHARS ? text : `…${text.slice(1 - LANE_CHARS)}`);\n\n  const state = { run: 0, filter: '', table: false, view: null, hot: null };\n\n  let lanes = [];\n  let placed = [];\n  let domain = 1;\n\n  // -- formatting ----------------------------------------------------------\n\n  const fmtDur = (v) => (v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${v.toFixed(1)} ms`);\n  const fmtAt = (v) => (v >= 1000 ? `+${(v / 1000).toFixed(2)} s` : `+${Math.round(v)} ms`);\n\n  function fmtTick(t, step) {\n    if (step >= 1000) return `${t / 1000}s`;\n    if (step >= 100) return `${(t / 1000).toFixed(1)}s`;\n    return `${t}ms`;\n  }\n\n  function ticks(start, end) {\n    const raw = (end - start) / 8 || 1;\n    const mag = 10 ** Math.floor(Math.log10(raw));\n    const step = ([1, 2, 5, 10].find((m) => mag * m >= raw) ?? 10) * mag;\n    const list = [];\n    for (let t = Math.ceil(start / step) * step; t <= end; t += step) list.push(t);\n    return { list, step };\n  }\n\n  // Text inside a fill takes white or black by whichever clears the fill.\n  const channel = (c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);\n\n  function inkOn(fill) {\n    const m = /^#?([0-9a-f]{6})$/i.exec(fill.trim());\n    if (!m) return '#ffffff';\n    const n = parseInt(m[1], 16);\n    const lum =\n      0.2126 * channel(((n >> 16) & 255) / 255) +\n      0.7152 * channel(((n >> 8) & 255) / 255) +\n      0.0722 * channel((n & 255) / 255);\n    return 1.05 / (lum + 0.05) >= (lum + 0.05) / 0.05 ? '#ffffff' : '#000000';\n  }\n\n  const fillOf = (kind) => getComputedStyle(document.documentElement).getPropertyValue(`--${KINDS[kind]}`);\n\n  // -- layout --------------------------------------------------------------\n\n  /** Bars of the selected run, packed into rows per process. */\n  function buildLanes() {\n    const q = state.filter.trim().toLowerCase();\n    const out = [];\n    for (const lane of data.lanes) {\n      const bars = [];\n      for (const [run, nameIndex, start, dur] of lane.b) {\n        if (run !== state.run) continue;\n        const name = data.names[nameIndex];\n        if (q && !name.toLowerCase().includes(q)) continue;\n        bars.push({ name, start, dur, row: 0 });\n      }\n      if (!bars.length) continue;\n      bars.sort((a, b) => a.start - b.start || b.dur - a.dur);\n      const rowEnds = [];\n      for (const bar of bars) {\n        let row = rowEnds.findIndex((end) => end <= bar.start);\n        if (row < 0) row = rowEnds.length;\n        rowEnds[row] = bar.start + bar.dur;\n        bar.row = row;\n      }\n      const [label, kind] = data.roles[lane.r];\n      out.push({ pid: lane.p, label, kind, bars, rows: rowEnds.length, start: bars[0].start });\n    }\n    out.sort((a, b) => a.start - b.start || a.label.localeCompare(b.label));\n    return out;\n  }\n\n  const plotWidth = () => Math.max(240, el('lanes').clientWidth - GUTTER - 12);\n  const scale = (t) => GUTTER + ((t - state.view.start) / (state.view.end - state.view.start)) * plotWidth();\n  const unscale = (x) => state.view.start + ((x - GUTTER) / plotWidth()) * (state.view.end - state.view.start);\n\n  // -- rendering -----------------------------------------------------------\n\n  function renderAxis() {\n    const width = GUTTER + plotWidth() + 12;\n    const svg = make('svg');\n    svg.setAttribute('height', AXIS_H);\n    svg.setAttribute('viewBox', `0 0 ${width} ${AXIS_H}`);\n    const { list, step } = ticks(state.view.start, state.view.end);\n    for (const t of list) {\n      const x = scale(t);\n      const text = make('text');\n      text.setAttribute('class', 'tick-text');\n      text.setAttribute('x', x);\n      text.setAttribute('y', AXIS_H - 8);\n      text.setAttribute('text-anchor', 'middle');\n      text.textContent = fmtTick(t, step);\n      svg.append(text);\n    }\n    el('ticks').replaceChildren(svg);\n  }\n\n  function renderScrollbar() {\n    const track = el('scrollbar');\n    const thumb = el('thumb');\n    const width = track.clientWidth;\n    const span = state.view.end - state.view.start;\n    const size = Math.max(24, (span / domain) * width);\n    // The thumb travels `width - size`, not `width`, so its minimum size does\n    // not push the right end past the track.\n    const travel = width - size;\n    const room = domain - span;\n    thumb.style.width = `${size}px`;\n    thumb.style.left = `${room > 0 ? (state.view.start / room) * travel : 0}px`;\n    track.setAttribute('aria-valuemin', '0');\n    track.setAttribute('aria-valuemax', String(Math.round(domain)));\n    track.setAttribute('aria-valuenow', String(Math.round(state.view.start)));\n    track.setAttribute('aria-valuetext', `${fmtAt(state.view.start)} to ${fmtAt(state.view.end)}`);\n  }\n\n  function renderLanes() {\n    const host = el('lanes');\n    placed = [];\n    if (!lanes.length) {\n      const empty = document.createElement('p');\n      empty.className = 'empty';\n      empty.textContent = 'No measures match this run and filter.';\n      host.replaceChildren(empty);\n      return;\n    }\n\n    const width = GUTTER + plotWidth() + 12;\n    const height = lanes.reduce((sum, lane) => sum + lane.rows * ROW_H + LANE_GAP, 0) + 8;\n    const svg = make('svg');\n    svg.setAttribute('height', height);\n    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);\n\n    const clipId = 'plot-clip';\n    const defs = make('defs');\n    const clip = make('clipPath');\n    clip.setAttribute('id', clipId);\n    const clipRect = make('rect');\n    clipRect.setAttribute('x', GUTTER);\n    clipRect.setAttribute('y', 0);\n    clipRect.setAttribute('width', width - GUTTER);\n    clipRect.setAttribute('height', height);\n    clip.append(clipRect);\n    defs.append(clip);\n    svg.append(defs);\n\n    const { list } = ticks(state.view.start, state.view.end);\n    for (const t of list) {\n      const line = make('line');\n      line.setAttribute('class', 'tick-line');\n      line.setAttribute('x1', scale(t));\n      line.setAttribute('x2', scale(t));\n      line.setAttribute('y1', 0);\n      line.setAttribute('y2', height);\n      svg.append(line);\n    }\n\n    const plot = make('g');\n    plot.setAttribute('clip-path', `url(#${clipId})`);\n    const ink = {};\n    for (const kind of KINDS.keys()) ink[kind] = inkOn(fillOf(kind));\n\n    let y = 4;\n    for (const lane of lanes) {\n      const laneHeight = lane.rows * ROW_H;\n\n      const label = make('text');\n      label.setAttribute('class', 'lane-label');\n      label.setAttribute('x', GUTTER - 10);\n      label.setAttribute('y', y + 11);\n      label.setAttribute('text-anchor', 'end');\n      const full = `${lane.label} · ${lane.pid}`;\n      label.textContent = fitLabel(full);\n      const title = make('title');\n      title.textContent = full;\n      label.append(title);\n      svg.append(label);\n\n      for (const bar of lane.bars) {\n        const x = scale(bar.start);\n        const w = Math.max(1.5, scale(bar.start + bar.dur) - x);\n        const barY = y + bar.row * ROW_H + (ROW_H - BAR_H) / 2;\n        if (x > width || x + w < GUTTER) continue;\n\n        const group = make('g');\n        group.setAttribute('class', `bar ${KINDS[lane.kind]}`);\n        group.setAttribute('tabindex', '0');\n        group.setAttribute('role', 'img');\n        group.setAttribute(\n          'aria-label',\n          `${bar.name}, ${fmtDur(bar.dur)}, starting ${fmtAt(bar.start)} in ${lane.label}`,\n        );\n\n        const rect = make('rect');\n        rect.setAttribute('x', x);\n        rect.setAttribute('y', barY);\n        rect.setAttribute('width', w);\n        rect.setAttribute('height', BAR_H);\n        group.append(rect);\n\n        // A label only goes inside a bar that fits it; the rest is on hover\n        // and in the table view, so no text is ever clipped.\n        if (w > bar.name.length * 5.4 + 12) {\n          const text = make('text');\n          text.setAttribute('class', 'bar-label');\n          text.setAttribute('x', x + 5);\n          text.setAttribute('y', barY + BAR_H - 3);\n          text.setAttribute('fill', ink[lane.kind]);\n          text.textContent = bar.name;\n          group.append(text);\n        }\n\n        plot.append(group);\n        placed.push({ bar, lane, x, w, y: barY, node: group });\n      }\n\n      y += laneHeight + LANE_GAP;\n      const rule = make('line');\n      rule.setAttribute('class', 'lane-rule');\n      rule.setAttribute('x1', 0);\n      rule.setAttribute('x2', width);\n      rule.setAttribute('y1', y - LANE_GAP / 2);\n      rule.setAttribute('y2', y - LANE_GAP / 2);\n      svg.append(rule);\n    }\n\n    svg.append(plot);\n    host.replaceChildren(svg);\n  }\n\n  function renderStats() {\n    const run = data.runs[state.run];\n    const bars = lanes.flatMap((lane) => lane.bars);\n    const longest = bars.reduce((best, bar) => (best && best.dur >= bar.dur ? best : bar), null);\n    el('stat-wall').textContent = fmtDur(run.wallMs);\n    el('stat-procs').textContent = String(lanes.length);\n    el('stat-measures').textContent = String(bars.length);\n    const cell = el('stat-longest');\n    cell.replaceChildren();\n    if (longest) {\n      cell.append(document.createTextNode(fmtDur(longest.dur)));\n      const note = document.createElement('small');\n      note.textContent = ` ${longest.name}`;\n      cell.append(note);\n    } else {\n      cell.textContent = '–';\n    }\n\n    const present = [...new Set(lanes.map((lane) => lane.kind))].sort();\n    const legend = el('legend');\n    legend.replaceChildren();\n    for (const kind of present) {\n      const item = document.createElement('span');\n      const swatch = document.createElement('i');\n      swatch.style.background = `var(--${KINDS[kind]})`;\n      item.append(swatch, document.createTextNode(KIND_LABELS[kind]));\n      legend.append(item);\n    }\n  }\n\n  function renderTable() {\n    const rows = lanes.flatMap((lane) => lane.bars.map((bar) => ({ lane, bar }))).sort((a, b) => b.bar.dur - a.bar.dur);\n    const table = document.createElement('table');\n    const caption = document.createElement('caption');\n    caption.textContent = `Every measure of ${data.runs[state.run].label}, longest first.`;\n    table.append(caption);\n\n    const head = document.createElement('tr');\n    for (const [text, cls] of [\n      ['Process', ''],\n      ['Pid', 'num'],\n      ['Measure', ''],\n      ['Starts at', 'num'],\n      ['Duration', 'num'],\n    ]) {\n      const th = document.createElement('th');\n      th.textContent = text;\n      if (cls) th.className = cls;\n      head.append(th);\n    }\n    const thead = document.createElement('thead');\n    thead.append(head);\n    table.append(thead);\n\n    const body = document.createElement('tbody');\n    for (const { lane, bar } of rows) {\n      const tr = document.createElement('tr');\n      for (const [text, cls] of [\n        [lane.label, ''],\n        [String(lane.pid), 'num'],\n        [bar.name, ''],\n        [fmtAt(bar.start), 'num'],\n        [fmtDur(bar.dur), 'num'],\n      ]) {\n        const td = document.createElement('td');\n        td.textContent = text;\n        if (cls) td.className = cls;\n        tr.append(td);\n      }\n      body.append(tr);\n    }\n    table.append(body);\n    el('table').replaceChildren(table);\n  }\n\n  function render() {\n    lanes = buildLanes();\n    renderStats();\n    if (state.table) renderTable();\n    else renderPlot();\n  }\n\n  function renderPlot() {\n    renderAxis();\n    renderScrollbar();\n    renderLanes();\n  }\n\n  /** Slides the visible window without changing its width. */\n  function panBy(deltaMs) {\n    clampView(state.view.start + deltaMs, state.view.end + deltaMs);\n    renderPlot();\n  }\n\n  // -- trace handoff -------------------------------------------------------\n\n  const PERFETTO = 'https://ui.perfetto.dev';\n\n  /**\n   * Perfetto's documented handoff. The tab it opens announces itself with a\n   * PONG, and the trace goes over postMessage, so nothing leaves the browser.\n   */\n  function openInPerfetto() {\n    const tab = window.open(PERFETTO);\n    if (!tab) return 'Allow popups';\n\n    const text = document.getElementById('trace-data').textContent;\n    const buffer = new TextEncoder().encode(text).buffer;\n    const ping = setInterval(() => tab.postMessage('PING', PERFETTO), 60);\n    const stop = () => {\n      clearInterval(ping);\n      removeEventListener('message', give);\n    };\n    const give = (event) => {\n      if (event.data !== 'PONG') return;\n      stop();\n      tab.postMessage({ perfetto: { buffer, title: data.title, fileName: 'graph-perf.trace.json' } }, PERFETTO);\n    };\n    addEventListener('message', give);\n    setTimeout(stop, 30000);\n    return 'Opened';\n  }\n\n  // -- tooltip -------------------------------------------------------------\n\n  function showTip(entry, clientX, clientY) {\n    if (state.hot === entry) return positionTip(clientX, clientY);\n    if (state.hot) state.hot.node.classList.remove('hot');\n    state.hot = entry;\n    entry.node.classList.add('hot');\n    el('lanes').classList.add('hovering');\n    el('tip-value').textContent = fmtDur(entry.bar.dur);\n    el('tip-name').textContent = entry.bar.name;\n    el('tip-meta').textContent = `${entry.lane.label} · pid ${entry.lane.pid} · starts ${fmtAt(entry.bar.start)}`;\n    el('tip').hidden = false;\n    positionTip(clientX, clientY);\n  }\n\n  function positionTip(clientX, clientY) {\n    const tip = el('tip');\n    const box = tip.getBoundingClientRect();\n    const x = Math.min(clientX + 14, window.innerWidth - box.width - 8);\n    const y = clientY + box.height + 20 > window.innerHeight ? clientY - box.height - 12 : clientY + 18;\n    tip.style.left = `${Math.max(8, x)}px`;\n    tip.style.top = `${Math.max(8, y)}px`;\n  }\n\n  function hideTip() {\n    if (state.hot) state.hot.node.classList.remove('hot');\n    state.hot = null;\n    el('lanes').classList.remove('hovering');\n    el('tip').hidden = true;\n  }\n\n  /** Nearest bar to the pointer, so a sub-pixel measure is still reachable. */\n  function nearest(x, y) {\n    let best = null;\n    let bestGap = 14;\n    for (const entry of placed) {\n      if (y < entry.y - 3 || y > entry.y + BAR_H + 3) continue;\n      const gap = x < entry.x ? entry.x - x : x > entry.x + entry.w ? x - entry.x - entry.w : 0;\n      if (gap < bestGap) {\n        best = entry;\n        bestGap = gap;\n      }\n    }\n    return best;\n  }\n\n  function svgPoint(event) {\n    const svg = el('lanes').querySelector('svg');\n    if (!svg) return null;\n    const box = svg.getBoundingClientRect();\n    const width = GUTTER + plotWidth() + 12;\n    return { x: ((event.clientX - box.left) / box.width) * width, y: event.clientY - box.top };\n  }\n\n  // -- interaction ---------------------------------------------------------\n\n  function resetView() {\n    domain = Math.max(\n      data.runs[state.run].wallMs,\n      ...data.lanes.flatMap((lane) => lane.b.filter((b) => b[0] === state.run).map((b) => b[2] + b[3])),\n      1,\n    );\n    state.view = { start: 0, end: domain };\n  }\n\n  function clampView(start, end) {\n    const span = Math.min(Math.max(end - start, MIN_SPAN), domain);\n    const from = Math.min(Math.max(start, 0), domain - span);\n    state.view = { start: from, end: from + span };\n  }\n\n  /** Dragging the thumb, clicking the track and the arrow keys all pan. */\n  function wireScrollbar() {\n    const track = el('scrollbar');\n    const thumb = el('thumb');\n    track.style.marginLeft = `${GUTTER}px`;\n    const left = (event) => event.clientX - track.getBoundingClientRect().left;\n\n    /** Window start for a thumb position, undoing the minimum-width scaling. */\n    const startAt = (x) => {\n      const span = state.view.end - state.view.start;\n      const travel = track.clientWidth - Math.max(24, (span / domain) * track.clientWidth);\n      return travel > 0 ? (x / travel) * (domain - span) : 0;\n    };\n\n    const slideTo = (start) => {\n      const span = state.view.end - state.view.start;\n      clampView(start, start + span);\n      renderPlot();\n    };\n\n    let grab = null;\n    thumb.addEventListener('pointerdown', (event) => {\n      grab = event.clientX - thumb.getBoundingClientRect().left;\n      track.classList.add('dragging');\n      thumb.setPointerCapture(event.pointerId);\n      hideTip();\n    });\n    thumb.addEventListener('pointermove', (event) => {\n      if (grab !== null) slideTo(startAt(left(event) - grab));\n    });\n    const drop = () => {\n      grab = null;\n      track.classList.remove('dragging');\n    };\n    thumb.addEventListener('pointerup', drop);\n    thumb.addEventListener('pointercancel', drop);\n\n    // Anywhere else on the track centres the window on that point.\n    track.addEventListener('pointerdown', (event) => {\n      if (event.target === thumb) return;\n      const span = state.view.end - state.view.start;\n      slideTo((left(event) / track.clientWidth) * domain - span / 2);\n    });\n\n    track.addEventListener('keydown', (event) => {\n      const span = state.view.end - state.view.start;\n      if (event.key === 'ArrowLeft') panBy(-span / 10);\n      else if (event.key === 'ArrowRight') panBy(span / 10);\n      else if (event.key === 'Home') slideTo(0);\n      else if (event.key === 'End') slideTo(domain - span);\n      else return;\n      event.preventDefault();\n    });\n  }\n\n  function wire() {\n    const runSelect = /** @type {HTMLSelectElement} */ (el('run'));\n    for (const [index, run] of data.runs.entries()) {\n      const option = document.createElement('option');\n      option.value = String(index);\n      option.textContent = run.label;\n      runSelect.append(option);\n    }\n    runSelect.addEventListener('change', () => {\n      state.run = Number(runSelect.value);\n      hideTip();\n      resetView();\n      render();\n    });\n\n    const filter = /** @type {HTMLInputElement} */ (el('filter'));\n    let pending = 0;\n    filter.addEventListener('input', () => {\n      state.filter = filter.value;\n      clearTimeout(pending);\n      pending = setTimeout(() => {\n        hideTip();\n        render();\n      }, 120);\n    });\n\n    el('reset').addEventListener('click', () => {\n      hideTip();\n      resetView();\n      render();\n    });\n\n    const tableButton = el('table-view');\n    tableButton.addEventListener('click', () => {\n      state.table = !state.table;\n      tableButton.setAttribute('aria-pressed', String(state.table));\n      el('chart').hidden = state.table;\n      el('table').hidden = !state.table;\n      el('reset').hidden = state.table;\n      el('hint').hidden = state.table;\n      hideTip();\n      render();\n    });\n\n    const traceButton = /** @type {HTMLButtonElement} */ (el('trace'));\n    traceButton.addEventListener('click', () => {\n      traceButton.disabled = true;\n      traceButton.textContent = openInPerfetto();\n      setTimeout(() => {\n        traceButton.textContent = 'Open in Perfetto';\n        traceButton.disabled = false;\n      }, 2600);\n    });\n\n    const themeButton = el('theme');\n    const stored = localStorage.getItem('graph-perf-theme');\n    if (stored) document.documentElement.dataset.theme = stored;\n    const syncTheme = () => {\n      const dark =\n        document.documentElement.dataset.theme === 'dark' ||\n        (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches);\n      themeButton.textContent = dark ? 'Light' : 'Dark';\n    };\n    syncTheme();\n    themeButton.addEventListener('click', () => {\n      const dark = themeButton.textContent === 'Dark';\n      document.documentElement.dataset.theme = dark ? 'dark' : 'light';\n      localStorage.setItem('graph-perf-theme', dark ? 'dark' : 'light');\n      syncTheme();\n      render();\n    });\n\n    const host = el('lanes');\n\n    host.addEventListener('pointermove', (event) => {\n      if (host.classList.contains('panning')) return;\n      const point = svgPoint(event);\n      if (!point) return;\n      const entry = nearest(point.x, point.y);\n      if (entry) showTip(entry, event.clientX, event.clientY);\n      else hideTip();\n    });\n    host.addEventListener('pointerleave', hideTip);\n\n    host.addEventListener('focusin', (event) => {\n      const entry = placed.find((candidate) => candidate.node === event.target);\n      if (!entry) return;\n      const box = entry.node.getBoundingClientRect();\n      showTip(entry, box.left + box.width / 2, box.bottom);\n    });\n    host.addEventListener('focusout', hideTip);\n\n    // Zoom is held behind ctrl or meta so the page keeps its own scrolling.\n    // A trackpad pinch arrives as a ctrl-wheel event, so it zooms too.\n    host.addEventListener(\n      'wheel',\n      (event) => {\n        // deltaMode 1 is lines, which a wheel mouse reports instead of pixels.\n        const steps = event.deltaMode === 1 ? 16 : 1;\n        const span = state.view.end - state.view.start;\n        if (!event.ctrlKey && !event.metaKey) {\n          // A sideways swipe pans. A vertical one is left to the page.\n          if (span >= domain || Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return;\n          event.preventDefault();\n          hideTip();\n          panBy(event.deltaX * steps * (span / plotWidth()));\n          return;\n        }\n        const point = svgPoint(event);\n        if (!point || point.x < GUTTER) return;\n        event.preventDefault();\n        const at = unscale(point.x);\n        const zoomed = span * (event.deltaY < 0 ? 0.8 : 1.25);\n        const ratio = (at - state.view.start) / span;\n        clampView(at - zoomed * ratio, at - zoomed * ratio + zoomed);\n        hideTip();\n        renderPlot();\n      },\n      { passive: false },\n    );\n\n    let anchor = null;\n    host.addEventListener('pointerdown', (event) => {\n      const point = svgPoint(event);\n      if (!point || point.x < GUTTER) return;\n      anchor = { x: point.x, start: state.view.start, end: state.view.end };\n      host.classList.add('panning');\n      host.setPointerCapture(event.pointerId);\n      hideTip();\n    });\n    host.addEventListener('pointermove', (event) => {\n      if (!anchor) return;\n      const point = svgPoint(event);\n      if (!point) return;\n      const perPixel = (anchor.end - anchor.start) / plotWidth();\n      const shift = (anchor.x - point.x) * perPixel;\n      clampView(anchor.start + shift, anchor.end + shift);\n      renderPlot();\n    });\n    const endPan = () => {\n      anchor = null;\n      host.classList.remove('panning');\n    };\n    host.addEventListener('pointerup', endPan);\n    host.addEventListener('pointercancel', endPan);\n    host.addEventListener('dblclick', () => {\n      resetView();\n      renderPlot();\n    });\n\n    wireScrollbar();\n\n    let frame = 0;\n    addEventListener('resize', () => {\n      cancelAnimationFrame(frame);\n      frame = requestAnimationFrame(render);\n    });\n  }\n\n  el('title').textContent = data.title;\n  el('subtitle').textContent = data.subtitle;\n  document.title = data.title;\n  resetView();\n  wire();\n  render();\n})();\n"
+	};
 }
 
 //#endregion
@@ -865,7 +891,7 @@ function renderMarkdown(r) {
 	}
 	if (r.concurrentProcesses > 1) sections.push(h2("Concurrent clients", "Wall time of each client in the run, fastest to slowest. Clients that find another process building the graph wait for it, so a narrow spread means they shared the work and a wide one means they queued behind it.", renderConcurrentClients(r.runs)));
 	sections.push(h2("Plugin config files", ...renderPluginConfigFiles(r.pluginConfigFiles)));
-	if (r.traces.length) sections.push(h2("Timelines", ...renderTimelines(r)));
+	if (r.traces.length) sections.push(h2("Timelines", `${code("graph-perf.html")} is an interactive timeline of every run: one lane per Nx process, one bar per measure, nested measures below the one that contains them. It is a single file with no network access, so opening it locally is enough.`, `${code("graph-perf.trace.json")} is the same measures in Chrome Trace Event Format, for ${link("https://speedscope.app", "speedscope")} or any flamegraph viewer that reads it. The viewer carries a copy, so its ${code("Open in Perfetto")} button needs no file at all. Perfetto opens with every process collapsed, so press expand-all above the track list to get named tracks and slices.`));
 	sections.push(h2("nx report", ...renderReport(r.report, r.traces, r.instrumented)));
 	sections.push(h2("nx.json", ...["plugins", "targetDefaults"].map((key) => h3(key, codeBlock(JSON.stringify("error" in r.nxJson ? r.nxJson.error : r.nxJson[key] ?? null, null, 2), "json")))));
 	return h1("Nx graph construction", summary, ...sections) + "\n";
@@ -1009,46 +1035,221 @@ function renderKeyPhases(root, traces) {
 		}
 	]);
 }
-const isKeyPhase = (name, kind) => KEY_PHASES.some((p) => p.pattern.test(name) && (!p.role || p.role === kind));
-/** Mermaid text is split on colons and semicolons; keep labels to safe characters. */
-const mermaidLabel = (text) => text.replace(/[:;#]/g, "-");
+const round1 = (n) => Math.round(n * 10) / 10;
+const escapeHtml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+/** Kind order the viewer colours by; anything else takes its neutral fourth slot. */
+const KIND_ORDER = [
+	"client",
+	"daemon",
+	"plugin worker"
+];
+/** Labels each run gets in the viewer and the trace: the phase and its cycle. */
+function runLabels(runs) {
+	const seen = {};
+	return runs.map((run) => {
+		seen[run.phase] = (seen[run.phase] ?? 0) + 1;
+		return `Cycle ${seen[run.phase]} \u00b7 ${run.phase}`;
+	});
+}
+/** Every measure of every run, compacted for the browser. */
+function timelineData(r) {
+	const names = [];
+	const nameIds = /* @__PURE__ */ new Map();
+	const intern = (name) => {
+		const seen = nameIds.get(name);
+		if (seen !== void 0) return seen;
+		nameIds.set(name, names.length);
+		return names.push(name) - 1;
+	};
+	const roles = [];
+	const roleIds = /* @__PURE__ */ new Map();
+	const internRole = (role) => {
+		const seen = roleIds.get(role);
+		if (seen !== void 0) return seen;
+		const kind = KIND_ORDER.indexOf(roleKind(role));
+		roleIds.set(role, roles.length);
+		return roles.push([role, kind === -1 ? KIND_ORDER.length : kind]) - 1;
+	};
+	const startedAt = new Map(r.runs.map((run) => [run.index, run.startedAt]));
+	const lanes = [];
+	for (const t of r.traces) {
+		const bars = [];
+		for (const m of t.measures) {
+			const t0 = startedAt.get(m.run);
+			if (t0 === void 0) continue;
+			const name = intern(shortName(r.workspaceRoot, m.name));
+			bars.push([
+				m.run,
+				name,
+				round1(t.timeOrigin + m.startTime - t0),
+				round1(m.duration)
+			]);
+		}
+		if (bars.length) lanes.push({
+			p: t.pid,
+			r: internRole(t.role),
+			b: bars
+		});
+	}
+	const sys = r.system;
+	return {
+		title: `Nx graph construction \u00b7 ${node_path.default.basename(r.workspaceRoot)}`,
+		subtitle: `${r.projectCount} projects \u00b7 ${sys.platform} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB \u00b7 node ${sys.node} \u00b7 collected ${r.collectedAt}`,
+		names,
+		roles,
+		runs: runLabels(r.runs).map((label, i) => ({
+			label,
+			wallMs: round1(r.runs[i].wallMs)
+		})),
+		lanes
+	};
+}
 /**
-* One Gantt chart per phase: every process that did work in that phase is a
-* section, and its top-level measures plus the key phases are the bars.
-* Times count from the phase's first run window.
+* The viewer with its stylesheet, script, chart data and trace inlined into one
+* file. The trace rides along because a page opened over `file:` cannot read
+* its own siblings, and handing it to Perfetto needs the bytes in hand.
 */
-function renderTimelines(r) {
-	const parts = ["First cycle, cold and warm only. Bars are top-level measures and key phases; time counts from the start of that run."];
-	for (const phase of ["cold", "warm"]) {
-		const first = r.runs.find((run) => run.phase === phase);
-		if (!first) continue;
-		const t0 = first.startedAt;
-		const lines = [
-			"gantt",
-			`  title ${phase}`,
-			"  dateFormat x",
-			"  axisFormat %S.%Ls",
-			"  todayMarker off"
-		];
-		let bars = 0;
-		for (const t of r.traces) {
-			const kind = roleKind(t.role);
-			const inPhase = t.measures.filter((m) => m.phase === phase && m.run === first.index);
-			if (!inPhase.length) continue;
-			const outer = new Set(topLevel(inPhase));
-			const shown = inPhase.filter((m) => outer.has(m) || isKeyPhase(m.name, kind));
-			if (!shown.length) continue;
-			lines.push(`  section ${mermaidLabel(t.role)} ${t.pid}`);
-			for (const m of shown) {
-				const start = Math.round(t.timeOrigin + m.startTime - t0);
-				const end = start + Math.max(1, Math.round(m.duration));
-				lines.push(`  ${mermaidLabel(shortName(r.workspaceRoot, m.name))} :${start}, ${end}`);
-				bars++;
+function renderHtml(r) {
+	const { html, css, js } = viewerAssets();
+	const data = timelineData(r);
+	const embed = (value) => value.replace(/</g, "\\u003c");
+	return html.replace("__TITLE__", () => escapeHtml(data.title)).replace("/*__CSS__*/", () => css).replace("/*__DATA__*/", () => embed(JSON.stringify(data))).replace("/*__TRACE__*/", () => embed(renderTrace(r).trim())).replace("/*__JS__*/", () => js);
+}
+/**
+* Thread ids for one process's measures. The trace format only stacks events
+* that nest strictly, so a measure joins a track when it fits inside that
+* track's innermost open event and starts a new one when it merely overlaps.
+*/
+function assignTracks(measures) {
+	const ordered = [...measures].sort((a, b) => a.startTime - b.startTime || b.duration - a.duration);
+	const tracks = [];
+	return ordered.map((measure) => {
+		const end = measure.startTime + measure.duration;
+		for (const [index, stack] of tracks.entries()) {
+			while (stack.length && stack[stack.length - 1] <= measure.startTime) stack.pop();
+			if (stack.length === 0 || end <= stack[stack.length - 1]) {
+				stack.push(end);
+				return {
+					measure,
+					track: index
+				};
 			}
 		}
-		if (bars) parts.push(h3(phase, codeBlock(lines.join("\n"), "mermaid")));
+		tracks.push([end]);
+		return {
+			measure,
+			track: tracks.length - 1
+		};
+	});
+}
+/**
+* Chrome Trace Event Format, which Perfetto, speedscope and the flamegraph
+* TUIs all read. One process per Nx process, one thread per stack of nested
+* measures, microseconds from the first thing that happened, so every cycle
+* sits on one timeline.
+*/
+function renderTrace(r) {
+	const origin = Math.min(...r.traces.map((t) => t.timeOrigin), ...r.runs.map((run) => run.startedAt));
+	const us = (epochMs) => Math.round((epochMs - origin) * 1e3);
+	const offsetUs = (timeOrigin) => (timeOrigin - origin) * 1e3;
+	const events = [{
+		name: "process_name",
+		ph: "M",
+		pid: 0,
+		tid: 0,
+		args: { name: "runs" }
+	}, {
+		name: "process_sort_index",
+		ph: "M",
+		pid: 0,
+		tid: 0,
+		args: { sort_index: -1 }
+	}];
+	const labels = runLabels(r.runs);
+	for (const [i, run] of r.runs.entries()) events.push({
+		name: labels[i],
+		ph: "X",
+		cat: "run",
+		pid: 0,
+		tid: 0,
+		ts: us(run.startedAt),
+		dur: us(run.endedAt) - us(run.startedAt),
+		args: {
+			phase: run.phase,
+			run: run.index,
+			wallMs: round1(run.wallMs)
+		}
+	});
+	let nextTid = 1;
+	for (const [order, t] of r.traces.entries()) {
+		events.push({
+			name: "process_name",
+			ph: "M",
+			pid: t.pid,
+			tid: 0,
+			args: { name: `${t.role} (${t.pid})` }
+		}, {
+			name: "process_sort_index",
+			ph: "M",
+			pid: t.pid,
+			tid: 0,
+			args: { sort_index: order }
+		});
+		const kind = roleKind(t.role);
+		const offset = offsetUs(t.timeOrigin);
+		const tids = /* @__PURE__ */ new Map();
+		const tidFor = (track) => {
+			const seen = tids.get(track);
+			if (seen !== void 0) return seen;
+			tids.set(track, nextTid);
+			return nextTid++;
+		};
+		for (const { measure, track } of assignTracks(t.measures)) {
+			const tid = tidFor(track);
+			const ts = Math.round(offset + measure.startTime * 1e3);
+			const end = Math.round(offset + (measure.startTime + measure.duration) * 1e3);
+			events.push({
+				name: shortName(r.workspaceRoot, measure.name),
+				ph: "X",
+				cat: kind,
+				pid: t.pid,
+				tid,
+				ts,
+				dur: end - ts,
+				args: {
+					phase: measure.phase,
+					run: measure.run,
+					...measure.detail ? { detail: measure.detail } : {}
+				}
+			});
+		}
+		for (const [track, tid] of tids) {
+			const name = track === 0 ? t.role : `${t.role} #${track + 1}`;
+			events.push({
+				name: "thread_name",
+				ph: "M",
+				pid: t.pid,
+				tid,
+				args: { name }
+			});
+			events.push({
+				name: "thread_sort_index",
+				ph: "M",
+				pid: t.pid,
+				tid,
+				args: { sort_index: track }
+			});
+		}
 	}
-	return parts;
+	return JSON.stringify({
+		displayTimeUnit: "ms",
+		otherData: {
+			workspace: r.workspaceRoot,
+			collectedAt: r.collectedAt,
+			projects: String(r.projectCount)
+		},
+		traceEvents: events
+	}) + "\n";
 }
 function renderPluginConfigFiles(plugins) {
 	if ("error" in plugins) return [plugins.error];
@@ -1243,8 +1444,13 @@ async function run(argv, workspaceRoot) {
 		};
 		node_fs.default.writeFileSync(node_path.default.join(outDir, "graph-perf.md"), renderMarkdown(result));
 		node_fs.default.writeFileSync(node_path.default.join(outDir, "graph-perf.json"), JSON.stringify(result, null, 2) + "\n");
+		if (traces.length) {
+			node_fs.default.writeFileSync(node_path.default.join(outDir, "graph-perf.html"), renderHtml(result));
+			node_fs.default.writeFileSync(node_path.default.join(outDir, "graph-perf.trace.json"), renderTrace(result));
+		}
 		const med = (values) => values.length ? `${Math.round(median(values))}ms` : "n/a";
-		console.log(`wrote ${node_path.default.join(outDir, "graph-perf.md")} and graph-perf.json`);
+		const written = ["graph-perf.json", ...traces.length ? ["graph-perf.html", "graph-perf.trace.json"] : []];
+		console.log(`wrote ${node_path.default.join(outDir, "graph-perf.md")}, ${written.join(", ")}`);
 		console.log(`projects ${projects.length}, cycles ${opts.runs}, cold median ${med(result.coldMs)}, warm median ${med(result.warmMs)}, semi-warm median ${med(result.semiWarmMs)}, recorded processes ${traces.length}, measures ${traces.reduce((n, t) => n + t.measures.length, 0)}`);
 	} finally {
 		for (const edit of edits) edit.restore();

@@ -1,0 +1,381 @@
+/* Light is the base; the media query covers the OS setting and the
+   data-theme scope covers the in-page toggle, which wins either way. */
+
+:root {
+  color-scheme: light;
+  --surface-1: #fcfcfb;
+  --plane: #f9f9f7;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --hairline: rgba(11, 11, 11, 0.1);
+  --client: #2a78d6;
+  --daemon: #eb6834;
+  --worker: #1baf7a;
+  --other: #898781;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --plane: #0d0d0d;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --hairline: rgba(255, 255, 255, 0.1);
+    --client: #3987e5;
+    --daemon: #d95926;
+    --worker: #199e70;
+    --other: #898781;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --plane: #0d0d0d;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --hairline: rgba(255, 255, 255, 0.1);
+  --client: #3987e5;
+  --daemon: #d95926;
+  --worker: #199e70;
+  --other: #898781;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--ink);
+  font:
+    13px/1.5 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}
+
+.viz {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+}
+
+h1 {
+  margin: 0 0 4px;
+  font-size: 19px;
+  font-weight: 600;
+}
+
+.sub {
+  margin: 0;
+  color: var(--ink-2);
+}
+
+/* Filters scope everything below them, so they sit in one row above the chart. */
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 20px 0 16px;
+}
+
+.filters label {
+  color: var(--ink-2);
+}
+
+select,
+input[type='search'],
+button {
+  font: inherit;
+  color: var(--ink);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 5px 9px;
+}
+
+input[type='search'] {
+  min-width: 200px;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--axis);
+}
+
+button[aria-pressed='true'] {
+  background: var(--ink);
+  color: var(--surface-1);
+  border-color: var(--ink);
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 28px;
+  padding: 14px 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 8px 8px 0 0;
+  border-bottom: 0;
+}
+
+.stat-label {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stat-value {
+  display: block;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.stat-value small {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--ink-2);
+}
+
+.legend {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin-left: auto;
+  align-self: center;
+  color: var(--ink-2);
+}
+
+.legend span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend i {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.panel {
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 0 0 8px 8px;
+}
+
+#axis {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--grid);
+}
+
+#axis svg,
+#lanes svg {
+  display: block;
+  width: 100%;
+}
+
+/* Drawn rather than native: at full zoom the plot would be millions of
+   pixels wide, so the transform stays in script and the thumb reports it. */
+
+#scrollbar {
+  position: relative;
+  height: 9px;
+  margin: 0 12px 5px 0;
+  border-radius: 5px;
+  background: var(--grid);
+  cursor: pointer;
+}
+
+#scrollbar:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+#thumb {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  min-width: 24px;
+  border-radius: 5px;
+  background: var(--muted);
+}
+
+#thumb:hover,
+#scrollbar:focus-visible #thumb {
+  background: var(--ink-2);
+}
+
+#scrollbar.dragging #thumb {
+  background: var(--ink);
+}
+
+#lanes {
+  cursor: grab;
+}
+
+#lanes.panning {
+  cursor: grabbing;
+}
+
+.lane-label {
+  fill: var(--ink-2);
+  font-size: 11px;
+}
+
+.lane-rule {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+
+.tick-line {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+
+.tick-text {
+  fill: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar rect {
+  rx: 2;
+}
+
+.bar {
+  outline: none;
+}
+
+.bar.client rect {
+  fill: var(--client);
+}
+
+.bar.daemon rect {
+  fill: var(--daemon);
+}
+
+.bar.worker rect {
+  fill: var(--worker);
+}
+
+/* Unclassified processes take the de-emphasis gray, never a fourth hue. */
+
+.bar.other rect {
+  fill: var(--other);
+}
+
+/* Hovering one bar recedes the rest, so a single span reads out of a dense run. */
+
+#lanes.hovering .bar:not(.hot) {
+  opacity: 0.3;
+}
+
+.bar.hot rect,
+.bar:focus-visible rect {
+  stroke: var(--ink);
+  stroke-width: 2;
+}
+
+.bar-label {
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.tip {
+  position: fixed;
+  z-index: 5;
+  max-width: 380px;
+  padding: 9px 11px;
+  background: var(--surface-1);
+  border: 1px solid var(--axis);
+  border-radius: 7px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
+  pointer-events: none;
+}
+
+.tip[hidden] {
+  display: none;
+}
+
+.tip-value {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.tip-name {
+  margin-top: 2px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.tip-meta {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+caption {
+  padding: 12px 16px;
+  text-align: left;
+  color: var(--ink-2);
+}
+
+th,
+td {
+  padding: 6px 16px;
+  text-align: left;
+  border-bottom: 1px solid var(--grid);
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+td.num {
+  text-align: right;
+}
+
+.empty {
+  padding: 40px 16px;
+  color: var(--muted);
+  text-align: center;
+}
