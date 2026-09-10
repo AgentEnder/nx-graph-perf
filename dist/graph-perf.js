@@ -275,8 +275,7 @@ function instrumentSource() {
 */
 const ENV_OVERRIDES = {
 	DOTNET_ROLL_FORWARD_TO_PRERELEASE: "1",
-	NX_TUI: "false",
-	NX_DAEMON: "true"
+	NX_TUI: "false"
 };
 const INJECTED_BY_NX = /* @__PURE__ */ new Set(["NX_ANALYTICS_SESSION_ID", "NX_USE_V8_SERIALIZER"]);
 function parseArgs(argv) {
@@ -288,8 +287,12 @@ function parseArgs(argv) {
 		out: ".",
 		reset: true,
 		instrument: true,
-		instrumentFile: null
+		instrumentFile: null,
+		daemon: true,
+		concurrentProcesses: 1,
+		affected: false
 	};
+	argv = argv.flatMap((arg) => /^--[^=]+=/.test(arg) ? [arg.slice(0, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg]);
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "--runs") opts.runs = Math.max(1, Number(argv[++i]));
@@ -300,8 +303,11 @@ function parseArgs(argv) {
 		else if (arg === "--no-reset") opts.reset = false;
 		else if (arg === "--no-instrument") opts.instrument = false;
 		else if (arg === "--instrument") opts.instrumentFile = argv[++i];
+		else if (arg === "--no-daemon") opts.daemon = false;
+		else if (arg === "--concurrent-processes") opts.concurrentProcesses = Math.max(1, Number(argv[++i]) || 1);
+		else if (arg === "--affected") opts.affected = true;
 		else if (arg === "--help" || arg === "-h") {
-			console.log("usage: node graph-perf.js [--runs CYCLES] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]");
+			console.log("usage: node graph-perf.js [--runs CYCLES] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE] [--no-daemon] [--concurrent-processes N] [--affected]");
 			process.exit(0);
 		} else {
 			console.error(`unknown argument: ${arg}`);
@@ -310,7 +316,7 @@ function parseArgs(argv) {
 	}
 	return opts;
 }
-function openWorkspace(root) {
+function openWorkspace(root, daemon) {
 	for (const key of Object.keys(process.env)) if (key === "CI" || /^NX_TASK_/.test(key) || INJECTED_BY_NX.has(key)) delete process.env[key];
 	const inheritedEnv = { ...process.env };
 	Object.assign(process.env, ENV_OVERRIDES, { NX_DAEMON: "false" });
@@ -320,7 +326,8 @@ function openWorkspace(root) {
 		require: require$1,
 		env: {
 			...inheritedEnv,
-			...ENV_OVERRIDES
+			...ENV_OVERRIDES,
+			NX_DAEMON: daemon ? "true" : "false"
 		},
 		nxBin: resolveFromWorkspace(require$1, "nx/bin/nx.js"),
 		perfLogging: resolveFromWorkspace(require$1, "nx/dist/src/utils/perf-logging.js") ?? resolveFromWorkspace(require$1, "nx/src/utils/perf-logging.js"),
@@ -362,6 +369,58 @@ function nx(ws, args) {
 		endedAt: Date.now(),
 		wallMs
 	};
+}
+/**
+* Runs `nx <args>` in `count` processes started together. The run's wall time
+* ends when the last client exits; each client's own wall time is kept too.
+* Output and exit status come from the first client that failed, or the first
+* client when none did.
+*/
+function nxConcurrent(ws, args, count) {
+	const startedAt = Date.now();
+	const started = process.hrtime.bigint();
+	const common = {
+		cwd: ws.root,
+		env: ws.env
+	};
+	const clients = Array.from({ length: count }, () => new Promise((resolve, reject) => {
+		const child = ws.nxBin ? (0, node_child_process.spawn)(process.execPath, [ws.nxBin, ...args], common) : (0, node_child_process.spawn)(process.platform === "win32" ? "npx.cmd" : "npx", ["nx", ...args], {
+			...common,
+			shell: process.platform === "win32"
+		});
+		let stdout = "";
+		let stderr = "";
+		child.stdout.setEncoding("utf8").on("data", (chunk) => stdout += chunk);
+		child.stderr.setEncoding("utf8").on("data", (chunk) => stderr += chunk);
+		child.on("error", reject);
+		child.on("close", (code) => resolve({
+			status: code ?? -1,
+			stdout,
+			stderr,
+			wallMs: Number(process.hrtime.bigint() - started) / 1e6
+		}));
+	}));
+	return Promise.all(clients).then((results) => {
+		const representative = results.find((r) => r.status !== 0) ?? results[0];
+		return {
+			status: representative.status,
+			stdout: representative.stdout,
+			stderr: representative.stderr,
+			startedAt,
+			endedAt: Date.now(),
+			wallMs: Math.max(...results.map((r) => r.wallMs)),
+			clientsMs: results.map((r) => r.wallMs)
+		};
+	});
+}
+/** Project names from the graph cache the cold run just wrote; null if it is not there. */
+function readCachedProjectNames(ws) {
+	try {
+		const graph = JSON.parse(node_fs.default.readFileSync(node_path.default.join(ws.root, ".nx", "workspace-data", "project-graph.json"), "utf8"));
+		return Object.keys(graph.nodes ?? {});
+	} catch {
+		return null;
+	}
 }
 function assertOk(label, result) {
 	if (result.status !== 0) {
@@ -796,7 +855,7 @@ const series = (values) => values.length ? `${values.join(", ")} ms${values.leng
 const countBy = (runs, phase) => runs.filter((run) => run.phase === phase).length;
 function renderMarkdown(r) {
 	const sys = r.system;
-	const summary = ul(`Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`, `Projects: ${r.projectCount}`, `Cycles: ${r.cycles}, each ${r.reset ? `${code("nx reset")}, ` : ""}cold ${code("nx show projects")}, warm, then semi-warm after ${r.edits.length} file edit${r.edits.length === 1 ? "" : "s"} in ${new Set(r.edits.map((e) => e.project)).size} project${new Set(r.edits.map((e) => e.project)).size === 1 ? "" : "s"}`, `Cold: ${series(r.coldMs)}`, `Warm: ${series(r.warmMs)}`, ...r.edits.length ? [`Semi-warm: ${series(r.semiWarmMs)}`] : [], ...r.reset ? [] : ["Daemon was not reset, so a cold run is only cold if no daemon was running."]);
+	const summary = ul(`Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`, `Projects: ${r.projectCount}`, `Cycles: ${r.cycles}, each ${r.reset ? `${code("nx reset")}, ` : ""}cold ${code(r.affected ? "nx show projects --affected" : "nx show projects")}, warm, then semi-warm after ${r.edits.length} file edit${r.edits.length === 1 ? "" : "s"} in ${new Set(r.edits.map((e) => e.project)).size} project${new Set(r.edits.map((e) => e.project)).size === 1 ? "" : "s"}`, `Cold: ${series(r.coldMs)}`, `Warm: ${series(r.warmMs)}`, ...r.edits.length ? [`Semi-warm: ${series(r.semiWarmMs)}`] : [], ...r.reset ? [] : ["Daemon was not reset, so a cold run is only cold if no daemon was running."], ...r.daemon ? [] : ["Daemon off (`--no-daemon`): every run builds the graph in the client, so warm and semi-warm measure the daemonless cache path."], ...r.affected ? ["With `--affected` the client also runs the touched-project locators, which load every plugin in the client process after the graph request."] : [], ...r.concurrentProcesses > 1 ? [`Concurrent clients: ${r.concurrentProcesses} started together for every measured command. A run's wall time is when its last client exited; the per-client spread is below.`] : []);
 	const sections = [];
 	if (r.traces.length === 0) sections.push("No recorded measures. Instrumentation was off or no Nx process loaded the perf-logging module.");
 	else {
@@ -804,11 +863,42 @@ function renderMarkdown(r) {
 		if (r.edits.length) sections.push(h2("Semi-warm edits", "Applied together, a newline each, right before every semi-warm run: one file per plugin whose glob matched anything, in as few projects as possible, then plain source files.", renderSemiWarmEdits(r)));
 		sections.push(h2("Key phases", "A phase that stays slow warm costs every command; one that is slow semi-warm costs every edit.", renderKeyPhases(r.workspaceRoot, r.traces)));
 	}
+	if (r.concurrentProcesses > 1) sections.push(h2("Concurrent clients", "Wall time of each client in the run, fastest to slowest. Clients that find another process building the graph wait for it, so a narrow spread means they shared the work and a wide one means they queued behind it.", renderConcurrentClients(r.runs)));
 	sections.push(h2("Plugin config files", ...renderPluginConfigFiles(r.pluginConfigFiles)));
 	if (r.traces.length) sections.push(h2("Timelines", ...renderTimelines(r)));
 	sections.push(h2("nx report", ...renderReport(r.report, r.traces, r.instrumented)));
 	sections.push(h2("nx.json", ...["plugins", "targetDefaults"].map((key) => h3(key, codeBlock(JSON.stringify("error" in r.nxJson ? r.nxJson.error : r.nxJson[key] ?? null, null, 2), "json")))));
 	return h1("Nx graph construction", summary, ...sections) + "\n";
+}
+function renderConcurrentClients(runs) {
+	const rows = runs.filter((run) => run.clientsMs && run.clientsMs.length > 1);
+	const sorted = (run) => [...run.clientsMs ?? []].sort((a, b) => a - b);
+	return table(rows, [
+		{
+			label: "run",
+			mapFn: (run) => String(run.index + 1)
+		},
+		{
+			label: "phase",
+			field: "phase"
+		},
+		{
+			label: "fastest",
+			mapFn: (run) => ms(sorted(run)[0])
+		},
+		{
+			label: "median",
+			mapFn: (run) => ms(median(sorted(run)))
+		},
+		{
+			label: "slowest",
+			mapFn: (run) => ms(sorted(run)[sorted(run).length - 1])
+		},
+		{
+			label: "clients",
+			mapFn: (run) => sorted(run).map((v) => (v / 1e3).toFixed(2)).join(", ")
+		}
+	]);
 }
 function renderSemiWarmEdits(r) {
 	return table(r.edits, [
@@ -1016,7 +1106,7 @@ function renderReport(report, traces, instrumented) {
 /** Collects and writes the report for the workspace at `workspaceRoot`. */
 async function run(argv, workspaceRoot) {
 	const opts = parseArgs(argv);
-	const ws = openWorkspace(workspaceRoot);
+	const ws = openWorkspace(workspaceRoot, opts.daemon);
 	const startedAt = (/* @__PURE__ */ new Date()).toISOString();
 	const outDir = node_path.default.resolve(ws.root, opts.out);
 	node_fs.default.mkdirSync(outDir, { recursive: true });
@@ -1032,12 +1122,14 @@ async function run(argv, workspaceRoot) {
 	const edits = [];
 	let projects = [];
 	let inspection = { error: "plugins were not inspected" };
-	const show = (label) => {
-		const result = nx(ws, [
-			"show",
-			"projects",
-			"--json"
-		]);
+	const showArgs = [
+		"show",
+		"projects",
+		...opts.affected ? ["--affected"] : [],
+		"--json"
+	];
+	const show = async (label) => {
+		const result = await nxConcurrent(ws, showArgs, opts.concurrentProcesses);
 		assertOk(`nx show projects (${label})`, result);
 		return result;
 	};
@@ -1047,6 +1139,7 @@ async function run(argv, workspaceRoot) {
 		startedAt: result.startedAt,
 		endedAt: result.endedAt,
 		wallMs: result.wallMs,
+		...result.clientsMs && result.clientsMs.length > 1 ? { clientsMs: result.clientsMs } : {},
 		...extra
 	});
 	try {
@@ -1058,17 +1151,18 @@ async function run(argv, workspaceRoot) {
 			}
 			if (instrument) announceSession(ws);
 			console.log(`${tag}: cold nx show projects --json`);
-			const cold = show("cold");
+			const cold = await show("cold");
 			record("cold", cold);
 			if (cycle === 1) try {
 				projects = JSON.parse(cold.stdout);
+				if (opts.affected) projects = readCachedProjectNames(ws) ?? projects;
 			} catch {
 				console.error("could not parse `nx show projects --json` output");
 				console.error(cold.stdout.slice(0, 500));
 				process.exit(1);
 			}
 			console.log(`${tag}: warm`);
-			record("warm", show("warm"));
+			record("warm", await show("warm"));
 			if (cycle === 1) {
 				withdrawSession(ws);
 				console.log(`${tag}: plugin config files`);
@@ -1093,7 +1187,7 @@ async function run(argv, workspaceRoot) {
 				for (const edit of edits) edit.touch();
 				await sleep(500);
 				record("semi-warm", {
-					...show("semi-warm"),
+					...await show("semi-warm"),
 					startedAt: editedAt
 				}, { edits: edits.map(({ file, project, plugins }) => ({
 					file,
@@ -1137,6 +1231,9 @@ async function run(argv, workspaceRoot) {
 				plugins
 			})),
 			reset: opts.reset,
+			daemon: opts.daemon,
+			concurrentProcesses: opts.concurrentProcesses,
+			affected: opts.affected,
 			runs,
 			instrumented: instrument !== null,
 			traces,

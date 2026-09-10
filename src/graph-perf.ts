@@ -26,7 +26,7 @@
  * Docker, and a daemonless run measures something else.
  */
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
@@ -43,6 +43,11 @@ interface Options {
   reset: boolean;
   instrument: boolean;
   instrumentFile: string | null;
+  daemon: boolean;
+  /** Clients started at once for every measured command. */
+  concurrentProcesses: number;
+  /** Measure `nx show projects --affected`, which loads plugins in the client. */
+  affected: boolean;
 }
 
 interface ProcessRecord {
@@ -77,6 +82,8 @@ type Run = {
   startedAt: number;
   endedAt: number;
   wallMs: number;
+  /** Wall time of each client when the run started more than one. */
+  clientsMs?: number[];
   /** Semi-warm runs: the files edited together right before the request. */
   edits?: EditPlan[];
 };
@@ -138,6 +145,7 @@ interface CommandResult {
   startedAt: number;
   endedAt: number;
   wallMs: number;
+  clientsMs?: number[];
 }
 
 /** Everything that depends on which workspace is being measured. */
@@ -157,7 +165,6 @@ interface Workspace {
 const ENV_OVERRIDES = {
   DOTNET_ROLL_FORWARD_TO_PRERELEASE: '1',
   NX_TUI: 'false',
-  NX_DAEMON: 'true',
 };
 
 const INJECTED_BY_NX = new Set(['NX_ANALYTICS_SESSION_ID', 'NX_USE_V8_SERIALIZER']);
@@ -172,7 +179,14 @@ function parseArgs(argv: string[]): Options {
     reset: true,
     instrument: true,
     instrumentFile: null,
+    daemon: true,
+    concurrentProcesses: 1,
+    affected: false,
   };
+  // `--flag=value` is split so both spellings reach the same branch.
+  argv = argv.flatMap((arg) =>
+    /^--[^=]+=/.test(arg) ? [arg.slice(0, arg.indexOf('=')), arg.slice(arg.indexOf('=') + 1)] : [arg],
+  );
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--runs') opts.runs = Math.max(1, Number(argv[++i]));
@@ -183,9 +197,12 @@ function parseArgs(argv: string[]): Options {
     else if (arg === '--no-reset') opts.reset = false;
     else if (arg === '--no-instrument') opts.instrument = false;
     else if (arg === '--instrument') opts.instrumentFile = argv[++i];
+    else if (arg === '--no-daemon') opts.daemon = false;
+    else if (arg === '--concurrent-processes') opts.concurrentProcesses = Math.max(1, Number(argv[++i]) || 1);
+    else if (arg === '--affected') opts.affected = true;
     else if (arg === '--help' || arg === '-h') {
       console.log(
-        'usage: node graph-perf.js [--runs CYCLES] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE]',
+        'usage: node graph-perf.js [--runs CYCLES] [--source-edits N] [--edit-file FILE] [--no-edit] [--out DIR] [--no-reset] [--no-instrument] [--instrument FILE] [--no-daemon] [--concurrent-processes N] [--affected]',
       );
       process.exit(0);
     } else {
@@ -196,7 +213,7 @@ function parseArgs(argv: string[]): Options {
   return opts;
 }
 
-function openWorkspace(root: string): Workspace {
+function openWorkspace(root: string, daemon: boolean): Workspace {
   // Drop what a wrapping nx or CI invocation stamped on this process. The
   // daemon rebuilds the graph when a client's env differs from the last one,
   // and these change on every `nx run` of the collector itself.
@@ -215,7 +232,9 @@ function openWorkspace(root: string): Workspace {
   return {
     root,
     require,
-    env: { ...inheritedEnv, ...ENV_OVERRIDES },
+    // Forced either way: Nx turns the daemon off under CI and inside Docker,
+    // and a daemonless run measures something else.
+    env: { ...inheritedEnv, ...ENV_OVERRIDES, NX_DAEMON: daemon ? 'true' : 'false' },
     // The workspace's own nx entry point, run with this node. `npx` would add
     // its own startup to every timing, and on Windows that is a second or more.
     nxBin: resolveFromWorkspace(require, 'nx/bin/nx.js'),
@@ -263,6 +282,62 @@ function nx(ws: Workspace, args: string[]): CommandResult {
     endedAt: Date.now(),
     wallMs,
   };
+}
+
+/**
+ * Runs `nx <args>` in `count` processes started together. The run's wall time
+ * ends when the last client exits; each client's own wall time is kept too.
+ * Output and exit status come from the first client that failed, or the first
+ * client when none did.
+ */
+function nxConcurrent(ws: Workspace, args: string[], count: number): Promise<CommandResult> {
+  const startedAt = Date.now();
+  const started = process.hrtime.bigint();
+  const common = { cwd: ws.root, env: ws.env };
+  const clients = Array.from(
+    { length: count },
+    () =>
+      new Promise<{ status: number; stdout: string; stderr: string; wallMs: number }>((resolve, reject) => {
+        const child = ws.nxBin
+          ? spawn(process.execPath, [ws.nxBin, ...args], common)
+          : spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['nx', ...args], {
+              ...common,
+              shell: process.platform === 'win32',
+            });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+        child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+        child.on('error', reject);
+        child.on('close', (code) =>
+          resolve({ status: code ?? -1, stdout, stderr, wallMs: Number(process.hrtime.bigint() - started) / 1e6 }),
+        );
+      }),
+  );
+  return Promise.all(clients).then((results) => {
+    const representative = results.find((r) => r.status !== 0) ?? results[0];
+    return {
+      status: representative.status,
+      stdout: representative.stdout,
+      stderr: representative.stderr,
+      startedAt,
+      endedAt: Date.now(),
+      wallMs: Math.max(...results.map((r) => r.wallMs)),
+      clientsMs: results.map((r) => r.wallMs),
+    };
+  });
+}
+
+/** Project names from the graph cache the cold run just wrote; null if it is not there. */
+function readCachedProjectNames(ws: Workspace): string[] | null {
+  try {
+    const graph = JSON.parse(
+      fs.readFileSync(path.join(ws.root, '.nx', 'workspace-data', 'project-graph.json'), 'utf8'),
+    );
+    return Object.keys(graph.nodes ?? {});
+  } catch {
+    return null;
+  }
 }
 
 function assertOk(label: string, result: CommandResult): void {
@@ -785,6 +860,9 @@ interface Collected {
   semiWarmMs: number[];
   edits: EditPlan[];
   reset: boolean;
+  daemon: boolean;
+  concurrentProcesses: number;
+  affected: boolean;
   runs: Run[];
   instrumented: boolean;
   traces: ProcessTrace[];
@@ -805,11 +883,26 @@ function renderMarkdown(r: Collected): string {
   const summary = md.ul(
     `Platform: ${sys.platform} ${sys.release} ${sys.arch}, ${sys.cpus} cpus, ${sys.memoryGb} GB, node ${sys.node}`,
     `Projects: ${r.projectCount}`,
-    `Cycles: ${r.cycles}, each ${r.reset ? `${md.code('nx reset')}, ` : ''}cold ${md.code('nx show projects')}, warm, then semi-warm after ${r.edits.length} file edit${r.edits.length === 1 ? '' : 's'} in ${new Set(r.edits.map((e) => e.project)).size} project${new Set(r.edits.map((e) => e.project)).size === 1 ? '' : 's'}`,
+    `Cycles: ${r.cycles}, each ${r.reset ? `${md.code('nx reset')}, ` : ''}cold ${md.code(r.affected ? 'nx show projects --affected' : 'nx show projects')}, warm, then semi-warm after ${r.edits.length} file edit${r.edits.length === 1 ? '' : 's'} in ${new Set(r.edits.map((e) => e.project)).size} project${new Set(r.edits.map((e) => e.project)).size === 1 ? '' : 's'}`,
     `Cold: ${series(r.coldMs)}`,
     `Warm: ${series(r.warmMs)}`,
     ...(r.edits.length ? [`Semi-warm: ${series(r.semiWarmMs)}`] : []),
     ...(r.reset ? [] : ['Daemon was not reset, so a cold run is only cold if no daemon was running.']),
+    ...(r.daemon
+      ? []
+      : [
+          'Daemon off (`--no-daemon`): every run builds the graph in the client, so warm and semi-warm measure the daemonless cache path.',
+        ]),
+    ...(r.affected
+      ? [
+          'With `--affected` the client also runs the touched-project locators, which load every plugin in the client process after the graph request.',
+        ]
+      : []),
+    ...(r.concurrentProcesses > 1
+      ? [
+          `Concurrent clients: ${r.concurrentProcesses} started together for every measured command. A run's wall time is when its last client exited; the per-client spread is below.`,
+        ]
+      : []),
   );
 
   const sections: string[] = [];
@@ -841,6 +934,15 @@ function renderMarkdown(r: Collected): string {
     );
   }
 
+  if (r.concurrentProcesses > 1) {
+    sections.push(
+      md.h2(
+        'Concurrent clients',
+        'Wall time of each client in the run, fastest to slowest. Clients that find another process building the graph wait for it, so a narrow spread means they shared the work and a wide one means they queued behind it.',
+        renderConcurrentClients(r.runs),
+      ),
+    );
+  }
   sections.push(md.h2('Plugin config files', ...renderPluginConfigFiles(r.pluginConfigFiles)));
   if (r.traces.length) sections.push(md.h2('Timelines', ...renderTimelines(r)));
   sections.push(md.h2('nx report', ...renderReport(r.report, r.traces, r.instrumented)));
@@ -859,6 +961,25 @@ function renderMarkdown(r: Collected): string {
   );
 
   return md.h1('Nx graph construction', summary, ...sections) + '\n';
+}
+
+function renderConcurrentClients(runs: Run[]): string {
+  const rows = runs.filter((run) => run.clientsMs && run.clientsMs.length > 1);
+  const sorted = (run: Run) => [...(run.clientsMs ?? [])].sort((a, b) => a - b);
+  return md.table(rows, [
+    { label: 'run', mapFn: (run) => String(run.index + 1) },
+    { label: 'phase', field: 'phase' },
+    { label: 'fastest', mapFn: (run) => ms(sorted(run)[0]) },
+    { label: 'median', mapFn: (run) => ms(median(sorted(run))) },
+    { label: 'slowest', mapFn: (run) => ms(sorted(run)[sorted(run).length - 1]) },
+    {
+      label: 'clients',
+      mapFn: (run) =>
+        sorted(run)
+          .map((v) => (v / 1000).toFixed(2))
+          .join(', '),
+    },
+  ]);
 }
 
 function renderSemiWarmEdits(r: Collected): string {
@@ -1056,7 +1177,7 @@ function renderReport(report: ReportData, traces: ProcessTrace[], instrumented: 
 /** Collects and writes the report for the workspace at `workspaceRoot`. */
 export async function run(argv: string[], workspaceRoot: string): Promise<void> {
   const opts = parseArgs(argv);
-  const ws = openWorkspace(workspaceRoot);
+  const ws = openWorkspace(workspaceRoot, opts.daemon);
   const startedAt = new Date().toISOString();
   const outDir = path.resolve(ws.root, opts.out);
   fs.mkdirSync(outDir, { recursive: true });
@@ -1081,8 +1202,14 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
   let projects: string[] = [];
   let inspection: PluginInspection | Failure = { error: 'plugins were not inspected' };
 
-  const show = (label: string) => {
-    const result = nx(ws, ['show', 'projects', '--json']);
+  // With --affected the client runs the touched-project locators after the
+  // graph request, and the plugin-glob locator loads every plugin in-process.
+  // That is the one path where a client walks the workspace itself instead of
+  // waiting on whichever process holds the graph lock, so it is what makes
+  // concurrent clients do concurrent work.
+  const showArgs = ['show', 'projects', ...(opts.affected ? ['--affected'] : []), '--json'];
+  const show = async (label: string) => {
+    const result = await nxConcurrent(ws, showArgs, opts.concurrentProcesses);
     assertOk(`nx show projects (${label})`, result);
     return result;
   };
@@ -1093,6 +1220,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
       startedAt: result.startedAt,
       endedAt: result.endedAt,
       wallMs: result.wallMs,
+      ...(result.clientsMs && result.clientsMs.length > 1 ? { clientsMs: result.clientsMs } : {}),
       ...extra,
     });
 
@@ -1108,11 +1236,12 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
       // The first request after a reset starts the daemon and builds the
       // graph from nothing; the next one is the round trip a developer feels.
       console.log(`${tag}: cold nx show projects --json`);
-      const cold = show('cold');
+      const cold = await show('cold');
       record('cold', cold);
       if (cycle === 1) {
         try {
           projects = JSON.parse(cold.stdout);
+          if (opts.affected) projects = readCachedProjectNames(ws) ?? projects;
         } catch {
           console.error('could not parse `nx show projects --json` output');
           console.error(cold.stdout.slice(0, 500));
@@ -1120,7 +1249,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
         }
       }
       console.log(`${tag}: warm`);
-      record('warm', show('warm'));
+      record('warm', await show('warm'));
 
       if (cycle === 1) {
         // Plugin loading here spawns its own workers; pause recording so they
@@ -1157,7 +1286,7 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
         const editedAt = Date.now();
         for (const edit of edits) edit.touch();
         await sleep(500);
-        const semiWarm = show('semi-warm');
+        const semiWarm = await show('semi-warm');
         record(
           'semi-warm',
           { ...semiWarm, startedAt: editedAt },
@@ -1196,6 +1325,9 @@ export async function run(argv: string[], workspaceRoot: string): Promise<void> 
       semiWarmMs: byPhase('semi-warm'),
       edits: edits.map(({ file, project, plugins }) => ({ file, project, plugins })),
       reset: opts.reset,
+      daemon: opts.daemon,
+      concurrentProcesses: opts.concurrentProcesses,
+      affected: opts.affected,
       runs,
       instrumented: instrument !== null,
       traces,
